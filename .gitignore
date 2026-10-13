@@ -1,0 +1,31 @@
+# Build outputs
+build/
+*.apk
+*.idsig
+*.dex
+*.class
+res.zip
+# app/build.sh copies device/start.sh into app/assets/ for every build
+app/assets/
+
+# Keys and secrets
+*.jks
+*.keystore
+*.p12
+adbkey*
+*.pem
+*.pass
+
+# Logs, caches and environments
+*.log
+__pycache__/
+venv/
+.venv/
+
+# Browser profiles
+profile/
+profiles/
+
+# Editor and system files
+.DS_Store
+*.swp

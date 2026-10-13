@@ -1,0 +1,183 @@
+#!/bin/bash
+# sleep-guard: Sleep Guard for the Googlebook. It keeps deep sleep, but it gives the USB-C charging
+# chip time to finish when the charger is plugged in or unplugged during sleep, so the laptop no
+# longer turns itself off.
+#
+# Uses ONLY Sleep Guard's own pairing key ("SleepGuard@googlebook") on its own private adb server
+# (port 5039), fully separate from Shadow Trackpad Fix and from the terminal's normal adb.
+#
+#   sleep-guard pair CODE IP:PAIRPORT [IP:CONNECTPORT]
+#                      pair Sleep Guard's own key (Wireless debugging > Pair device with pairing code)
+#   sleep-guard install-app [--force]   build, install or update the Sleep Guard app and give it the key
+#   sleep-guard status | log [N] | check
+#   sleep-guard start | stop            (stop sticks until start, also across reboots)
+#   sleep-guard connect [IP:PORT]       reconnect (normally automatic via the app's port file)
+#   sleep-guard usb-debugging on|off    allow the app to keep USB debugging on (keeps the helper
+#                                       alive if Wireless debugging drops); off by default
+#
+# Optional environment variables:
+#   SLEEP_GUARD_CONF      keys and settings (default: ~/.config/sleep-guard)
+#   SLEEP_GUARD_REPO      the Sleep Guard source folder (default: the folder above this script,
+#                         following a symlink)
+#   SLEEP_GUARD_PORT_DIR  where the app's published port file appears in the Linux terminal
+#                         (default: /mnt/shared/Documents/Sleep Guard)
+set -euo pipefail
+CONF=${SLEEP_GUARD_CONF:-$HOME/.config/sleep-guard}
+KEYDIR=$CONF/adbkey
+H=$CONF/adbhome            # HOME for Sleep Guard's private adb server (holds its key)
+export ANDROID_ADB_SERVER_PORT=5039
+APP=local.sleepguard
+REPO=${SLEEP_GUARD_REPO:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}
+APP_SRC=$REPO/app
+DIR=/data/local/tmp/sleepguard
+DOCS="${SLEEP_GUARD_PORT_DIR:-/mnt/shared/Documents/Sleep Guard}"
+FORCE=0
+for a in "$@"; do [ "$a" = "--force" ] && FORCE=1; done
+sgadb() { HOME=$H adb "$@"; }
+
+key_secret() {
+    [ -r "$KEYDIR/adbkey" ] || return 1
+    printf 'sleepguard-v1' | openssl dgst -sha256 -sign "$KEYDIR/adbkey" -binary 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+hmac_hex() { python3 -I -c 'import hmac,hashlib,sys; print(hmac.new(bytes.fromhex(sys.argv[1]), sys.argv[2].encode(), hashlib.sha256).hexdigest())' "$1" "$2"; }
+
+# Wireless debugging's address as published by the app (signed with the shared key secret).
+published() {
+    local k f addr mac t best="" bestt=-1
+    k=$(key_secret) || return 0
+    for f in "$DOCS"/adb-port*.txt; do
+        [ -r "$f" ] || continue
+        addr="" mac=""
+        read -r addr mac < "$f" || true
+        [[ "$addr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$ ]] || continue
+        [ -n "$mac" ] && [ "$(hmac_hex "$k" "port:$addr")" = "$mac" ] || continue
+        t=$(stat -c %Y "$f")
+        if [ "$t" -gt "$bestt" ]; then best=$addr; bestt=$t; fi
+    done
+    echo "$best"
+}
+connected() { sgadb devices 2>/dev/null | awk 'NR>1 && $2=="device" && $1 ~ /^[0-9.]+:[0-9]+$/ {print $1; exit}'; }
+
+need_device() {
+    DEV=$(connected || true)
+    if [ -z "$DEV" ]; then
+        local pub; pub=$(published)
+        [ -n "$pub" ] && sgadb connect "$pub" >/dev/null 2>&1 || true
+        sleep 1
+        DEV=$(connected || true)
+    fi
+    if [ -z "$DEV" ]; then
+        echo "Sleep Guard is not connected to the Googlebook." >&2
+        echo "Make sure Wireless debugging is on, then: sleep-guard connect IP:PORT (shown on the Wireless debugging screen)" >&2
+        exit 1
+    fi
+}
+ash() { sgadb -s "$DEV" shell "$@"; }
+# The supervisor script bundled with the current app build (the app installs the same one on each
+# of its runs - but not while Sleep Guard is stopped, so start/stop install it themselves first).
+install_script() {
+    local s="$APP_SRC/assets/start.sh"             # copied there by app/build.sh
+    [ -r "$s" ] || s="$REPO/device/start.sh"       # not built yet: the same script from the source
+    sgadb -s "$DEV" push "$s" "$DIR/start.sh.new-vm" >/dev/null &&
+        ash "mkdir -p $DIR && chmod 700 $DIR && mv $DIR/start.sh.new-vm $DIR/start.sh && chmod 700 $DIR/start.sh"
+}
+user() { ash "am get-current-user" 2>/dev/null | tr -dc 0-9; }
+
+# Before the key is sent: the device must prove it is this Googlebook with the Sleep Guard app
+# holding that key (a look-alike adb service can't answer).
+verify_device() {
+    [ -f "$KEYDIR/provisioned" ] || return 0
+    [ "$FORCE" = 1 ] && { echo "(--force: device check skipped)"; return 0; }
+    local k nonce res
+    k=$(key_secret) || return 1
+    nonce=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    res=$(ash "am broadcast --user $(user) -n $APP/.ControlReceiver -a local.sleepguard.CONFIG --es challenge $nonce" 2>/dev/null | tail -1)
+    [[ "$res" == *"proof=$(hmac_hex "$k" "challenge:$nonce")"* ]] && return 0
+    echo "The device could not prove it is your Googlebook with the Sleep Guard app (answer: ${res:-none})." >&2
+    echo "Nothing was sent. After reinstalling the app or clearing its data, repeat with --force." >&2
+    return 1
+}
+provision() {
+    ash "am broadcast --user $(user) -n $APP/.ControlReceiver -a local.sleepguard.PROVISION --es p12 $(base64 -w0 "$KEYDIR/key.p12") --es pass $(cat "$KEYDIR/p12.pass")" | tail -1
+}
+
+case "${1:-status}" in
+    pair)
+        code=${2:-}; paddr=${3:-}; caddr=${4:-}
+        if [ -z "$code" ] || [ -z "$paddr" ]; then
+            echo "On the Googlebook: Settings > System > Developer options > Wireless debugging >"
+            echo "  'Pair device with pairing code'. Keep that dialog open."
+            read -rp "Pairing code: " code
+            read -rp "IP address & port shown in that dialog: " paddr
+        fi
+        mkdir -p "$KEYDIR" "$H/.android" && chmod 700 "$CONF" "$KEYDIR" "$H" "$H/.android"
+        if [ ! -f "$KEYDIR/adbkey" ]; then
+            adb keygen "$KEYDIR/adbkey" >/dev/null 2>&1
+            echo "$(awk '{print $1}' "$KEYDIR/adbkey.pub") SleepGuard@googlebook" > "$KEYDIR/adbkey.pub"
+        fi
+        cp "$KEYDIR/adbkey" "$KEYDIR/adbkey.pub" "$H/.android/" && chmod 600 "$H/.android/adbkey"
+        result=$(timeout 40 env HOME=$H adb pair "$paddr" "$code" 2>&1 || true)
+        echo "$result"
+        [[ "$result" == *"Successfully paired"* ]] || { echo "Pairing failed, and nothing was changed. Try again with a fresh code."; exit 1; }
+        [ -f "$KEYDIR/p12.pass" ] || (umask 077; head -c 24 /dev/urandom | base64 | tr -d '/+=' > "$KEYDIR/p12.pass")
+        openssl req -new -x509 -key "$KEYDIR/adbkey" -out "$KEYDIR/cert.pem" -days 36500 -subj /CN=SleepGuard 2>/dev/null
+        openssl pkcs12 -export -inkey "$KEYDIR/adbkey" -in "$KEYDIR/cert.pem" -out "$KEYDIR/key.p12" -passout "pass:$(cat "$KEYDIR/p12.pass")" 2>/dev/null
+        chmod 600 "$KEYDIR/key.p12" "$KEYDIR/cert.pem"
+        ip=${paddr%:*}
+        if [ -n "$caddr" ]; then sgadb connect "$caddr"
+        else echo "Paired. Now connect: sleep-guard connect $ip:PORT (the port on the main Wireless debugging screen)"; fi
+        ;;
+    connect)
+        if [ -n "${2:-}" ]; then sgadb connect "$2"; else need_device; echo "connected: $DEV"; fi
+        ;;
+    install-app)
+        need_device
+        "$APP_SRC/build.sh" | tail -1
+        u=$(user)
+        sgadb -s "$DEV" install -r --user "$u" "$APP_SRC/SleepGuard.apk" | tail -1
+        for perm in android.permission.WRITE_SECURE_SETTINGS android.permission.POST_NOTIFICATIONS android.permission.ACCESS_LOCAL_NETWORK; do
+            ash "pm grant --user $u $APP $perm" 2>/dev/null || true
+        done
+        ash "pm set-permission-flags --user $u $APP android.permission.POST_NOTIFICATIONS user-set user-fixed; pm set-permission-flags --user $u $APP android.permission.ACCESS_LOCAL_NETWORK user-set user-fixed; appops set --user $u $APP AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore; appops set --user $u $APP RUN_ANY_IN_BACKGROUND allow; cmd deviceidle whitelist +$APP" >/dev/null
+        if [ -f "$KEYDIR/key.p12" ]; then
+            verify_device || exit 1
+            res=$(provision)
+            if [[ "$res" != *provisioned* ]]; then
+                echo "The app did not respond ($res), so it is opened once to clear Android's background-start block..."
+                ash "am start --user $u -n $APP/.MainActivity" >/dev/null 2>&1; sleep 4
+                ash "am start --user $u -n com.android.virtualization.terminal/.new2.ui.MainActivity" >/dev/null 2>&1
+                res=$(provision)
+            fi
+            echo "$res"
+            [[ "$res" == *provisioned* ]] && touch "$KEYDIR/provisioned"
+        else
+            echo "There is no paired key yet. Run: sleep-guard pair"
+        fi
+        ash "am broadcast --user $u -n $APP/.ControlReceiver -a local.sleepguard.KICK --ez restart true" >/dev/null
+        echo "Sleep Guard installed; the app (re)starts the helper now and after every reboot."
+        ;;
+    start)
+        need_device
+        install_script
+        ash "am broadcast --user $(user) -n $APP/.ControlReceiver -a local.sleepguard.CONFIG --ez stopped false" >/dev/null 2>&1 || true
+        ash "sh $DIR/start.sh start"
+        ;;
+    stop)
+        need_device
+        install_script
+        ash "am broadcast --user $(user) -n $APP/.ControlReceiver -a local.sleepguard.CONFIG --ez stopped true" >/dev/null 2>&1 || true
+        ash "sh $DIR/start.sh stop"
+        ;;
+    status) need_device; ash "sh $DIR/start.sh status ${2:-12}" ;;
+    log)    need_device; ash "tail -n ${2:-60} $DIR/sleepguard.log" ;;
+    check)
+        need_device
+        ash "A=\$(pm path --user current $APP 2>/dev/null | head -1 | cut -d: -f2); [ -r \"\$A\" ] || A=$DIR/sleepguard.dex; CLASSPATH=\$A app_process / local.sleepguard.SleepGuard check"
+        ;;
+    usb-debugging)
+        need_device
+        v=false; [ "${2:-}" = on ] && v=true
+        ash "am broadcast --user $(user) -n $APP/.ControlReceiver -a local.sleepguard.CONFIG --ez usb_debugging $v" | tail -1
+        ;;
+    *) sed -n '2,/^set -euo/p' "$0" | grep '^#'; exit 2 ;;
+esac

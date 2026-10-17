@@ -213,6 +213,13 @@ Sleep Guard pairs its own key in step 4 below, separately from the pairing in th
    `sleep-guard connect 192.0.2.10:41000`. If you run `sleep-guard pair` with no arguments, it asks for the code and
    the pairing address.
 
+   **Keep the pairing: turn on "Disable adb authorization timeout"** on the same Developer options screen and leave
+   it on. Without it, Android silently forgets every Wireless debugging pairing that has not connected for 7 days.
+   On 2026-10-17 that removed Sleep Guard's key (and Shadow Trackpad Fix's) after exactly 7 days, Sleep Guard stopped
+   working, and nothing had warned me. Since that day the `sleep-guard` command switches the timeout off by itself
+   whenever its connection works (one short `settings put global adb_allowed_connection_time 0`), and the pairing
+   step above is the way back if a pairing has already been lost.
+
    The first time, this creates a new adb key labeled `SleepGuard@googlebook` in `~/.config/sleep-guard/adbkey`.
    Then it pairs that key and keeps it for Sleep Guard only. Sleep Guard's adb server runs on its own port (5039)
    with its own home folder, so it never touches your normal adb connection or any other project's key. The pairing

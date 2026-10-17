@@ -220,7 +220,7 @@ Sleep Guard pairs its own key in step 4 below, separately from the pairing in th
    whenever its connection works (one short `settings put global adb_allowed_connection_time 0`), and the pairing
    step above is the way back if a pairing has already been lost.
 
-   The first time, this creates a new adb key labeled `SleepGuard@googlebook` in `~/.config/sleep-guard/adbkey`.
+   The first time, this creates a new adb key in `~/.config/sleep-guard/adbkey` (its file carries the label `SleepGuard@googlebook`; on the Googlebook the pairing shows the Linux Terminal's own name, for example `droid@debian`, like every pairing made from the Terminal).
    Then it pairs that key and keeps it for Sleep Guard only. Sleep Guard's adb server runs on its own port (5039)
    with its own home folder, so it never touches your normal adb connection or any other project's key. The pairing
    is listed under **Wireless debugging > Paired devices**.
@@ -392,7 +392,7 @@ run `sleep-guard start` or press **Check / start**.
    ```
 
 4. **Remove the pairing.** On the Googlebook, open **Wireless debugging > Paired devices**, select Sleep Guard's
-   entry (its key is labeled `SleepGuard@googlebook`) and tap **Forget**.
+   entry (it shows the Terminal's name, for example `droid@debian`; the key file is labeled `SleepGuard@googlebook`) and tap **Forget**.
 
 5. **Stop Sleep Guard's adb server and remove the files in the Linux Terminal.** The configuration folder holds the
    adb key and the signing keystore.
@@ -418,7 +418,7 @@ The app does not have Sleep Guard's key yet. Run `sleep-guard pair` (if you have
 `sleep-guard install-app`.
 
 **The app says "Wireless debugging no longer accepts Sleep Guard's key".**
-The `SleepGuard@googlebook` pairing was probably removed. Pair again with `sleep-guard pair`. The same key is used
+Sleep Guard's pairing was probably removed (Android does that by itself after 7 days without a connection unless "Disable adb authorization timeout" is on). Pair again with `sleep-guard pair`. The same key is used
 again, so the app works again as soon as the pairing exists. If it still fails, run `sleep-guard install-app`.
 
 **The app says "Could not reach Wireless debugging" or "Waiting for Wi-Fi".**

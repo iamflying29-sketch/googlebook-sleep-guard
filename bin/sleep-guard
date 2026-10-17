@@ -63,8 +63,8 @@ connected() { sgadb devices 2>/dev/null | awk 'NR>1 && $2=="device" && $1 ~ /^[0
 # silently removed this app's pairing and the pairing of another helper, so whenever a connection works, the
 # timeout is switched off once (one short, bounded command; nothing else on the device changes).
 keep_pairing() {
-    local v; v=$(timeout 15 sgadb -s "$DEV" shell settings get global adb_allowed_connection_time 2>/dev/null | tr -d '\r')
-    [ "$v" = "0" ] || timeout 15 sgadb -s "$DEV" shell settings put global adb_allowed_connection_time 0 >/dev/null 2>&1 || true
+    local v; v=$(timeout 15 sgadb -s "$DEV" shell settings get global adb_allowed_connection_time </dev/null 2>/dev/null | tr -d '\r')
+    [ "$v" = "0" ] || timeout 15 sgadb -s "$DEV" shell settings put global adb_allowed_connection_time 0 </dev/null >/dev/null 2>&1 || true
 }
 need_device() {
     DEV=$(connected || true)

@@ -46,7 +46,9 @@ import java.util.TimeZone;
  *  - Each wake from deep sleep with the lid closed (a charger change wakes the laptop): within ~5 ms
  *    Sleep Guard takes the sleep lock for GRAB_MS while it checks the charger (every 25 ms).
  *    Changed: a 20 s settle; otherwise straight back to sleep.
- *  - A charger change while awake: a 20 s settle (the same lock).
+ *  - A charger change with the screen off (the laptop asleep with the lid open): a 20 s settle (the
+ *    same lock). With the lid open and the screen on the laptop is in use and cannot fall asleep, so
+ *    Sleep Guard does nothing at all then (it only logs the change).
  *  - When a window ends the lock is released and GooglebookOS sleeps as it would have anyway.
  *
  * Safety / update-proofing:
@@ -60,7 +62,8 @@ import java.util.TimeZone;
  *  - Never calls System.exit while holding grabLock; awake-time budgets for wake holds and settles.
  *  - Watchdog: a stalled main loop releases everything and exits (the supervisor restarts it).
  *  - Reads of service reports never block a service (see dump()); every command has a time limit;
- *    service calls every 500 ms (every 100 ms for 3 s after a wake, lid or charger change); the
+ *    service calls every 500 ms (every 2 s while the laptop is in use with the lid open and the
+ *    screen on, every 100 ms for 3 s after a wake, lid or charger change); the
  *    5 ms wake detector only reads two clocks and runs only while the laptop can deep sleep.
  *  - Single instance (lock file in the shell-only directory). Never deletes anything; never
  *    injects input; never changes the lid state.
@@ -73,6 +76,8 @@ public final class SleepGuard {
     // 2026-10-10 tests). Only a real charger change keeps the laptop awake (SETTLE_MS).
     static final long SETTLE_MS = 20_000, GRAB_MS = 300, CHECK_AFTER_MS = 150;
     static final long PASS_MS = 40, POLL_MS = 500, POLL_FAST_MS = 100, POLL_GRAB_MS = 25, FAST_MS = 3000, DETECT_MS = 5;
+    /** Lid open and screen on: the laptop is in use and cannot fall asleep; only a slow look at the charger. */
+    static final long POLL_IN_USE_MS = 2000;
     static final String DIR = "/data/local/tmp/sleepguard";
     static final String LOG = DIR + "/sleepguard.log";
     static final String STANDDOWN = DIR + "/standdown"; // "none" or "STANDING DOWN: <reason> | build=<fp>"
@@ -753,7 +758,7 @@ public final class SleepGuard {
             if (lidEvent) fastUntil = Math.max(fastUntil, now + FAST_MS);
             final boolean fast = now < fastUntil;
             final boolean grabbing = now < protectUntil && settleLock == null && wakeLock != null;
-            if (now - lastPollAt >= (grabbing ? POLL_GRAB_MS : fast ? POLL_FAST_MS : POLL_MS)) {
+            if (now - lastPollAt >= (grabbing ? POLL_GRAB_MS : fast ? POLL_FAST_MS : (!lid && screenOn) ? POLL_IN_USE_MS : POLL_MS)) {
                 lastPollAt = now;
                 Boolean cc = chargerConnected();
                 if (cc != null) {
@@ -789,6 +794,12 @@ public final class SleepGuard {
                 if (!flapLogged) log("the charger keeps connecting and disconnecting (" + settleTimes.size() + " changes in "
                         + (SETTLE_BUDGET_WINDOW_MS / 60_000) + " minutes): no keep-awake settles until it is steady again", true);
                 flapLogged = true;
+                prevCharger = charger;
+            } else if (charger != prevCharger && !lid && screenOn) {
+                // The laptop is in use (lid open, screen on): it cannot fall asleep, so there is nothing to
+                // protect and Sleep Guard stays out of the way entirely (no lock, nothing held).
+                flapLogged = false;
+                log("charger " + (charger ? "CONNECTED" : "DISCONNECTED") + " (lid open, screen on): nothing to do", true);
                 prevCharger = charger;
             } else if (charger != prevCharger) {
                 flapLogged = false;

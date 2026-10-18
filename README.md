@@ -86,9 +86,11 @@ removes all of that. Sleep Guard now never touches the lid state.
    this safe: the laptop cannot fall back asleep until it is released. During the hold the helper reads the charger
    state from the battery service every 25 milliseconds. Holds are never skipped, but once they add up to 15 seconds
    within 15 minutes, each new hold is shortened to 0.15 seconds.
-3. **The settle.** When the charger state changes, at any time, the helper takes the sleep lock for the settle
-   (`SleepGuard:settle`) for 20 seconds, so the USB-C controller can finish before the laptop is allowed back into
-   deep sleep. A charger that keeps connecting and disconnecting (a loose plug or a failing cable) does not keep the
+3. **The settle.** When the charger state changes while the laptop could be asleep (the lid closed, or the screen
+   off), the helper takes the sleep lock for the settle (`SleepGuard:settle`) for 20 seconds, so the USB-C
+   controller can finish before the laptop is allowed back into deep sleep. While the laptop is in use, with the lid
+   open and the screen on, it cannot fall asleep, so Sleep Guard does nothing at all at a charger change: it only
+   writes a line to its log, and it reads the battery report just once every 2 seconds. A charger that keeps connecting and disconnecting (a loose plug or a failing cable) does not keep the
    laptop awake without end: after 20 changes within 15 minutes the settles pause until it is steady again.
 4. **Handing back to stock.** When the window ends, the helper releases the lock and GooglebookOS puts the laptop
    back into deep sleep exactly as it would have anyway. Nothing else was changed, so nothing has to be undone.

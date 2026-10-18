@@ -259,7 +259,7 @@ fresh check when it opens.
 | --- | --- |
 | **Check / start** | Makes sure the helper runs. After a Stop or a stand-down it turns Sleep Guard back on. |
 | **Restart** | Stops the helper and the supervisor and starts them again in one command. |
-| **Stop** | Stops the helper and the supervisor. Sleep Guard stays stopped, also across reboots, until you press **Check / start** or run `sleep-guard start`. While it is stopped, the app still keeps the published Wireless debugging address current, so `sleep-guard start` can always connect. |
+| **Stop** | Stops the helper and the supervisor. Sleep Guard stays stopped, also across reboots, until you press **Check / start** or run `sleep-guard start`. While it is stopped, the app leaves the debugging switches alone and only keeps the published Wireless debugging address current, so `sleep-guard start` can always connect. If a Stop could not reach the device, the next check carries it out. |
 | **Wireless debugging settings** | Opens Developer options. |
 
 The app posts these notifications:
@@ -338,7 +338,7 @@ adb shell 'CLASSPATH=$(pm path --user current local.sleepguard | head -1 | cut -
 | `check` | The self-test and current readings (the same as `sleep-guard check`). |
 | `dumptest` | Reads the power service's report 20 times, then stops reading early on purpose (after 1 KB and after 1 millisecond) and confirms that the power service still answers normally. |
 | `locktest` | Takes the sleep lock, confirms that the power service lists it as active and holds its kernel suspend blocker, releases it and confirms that it is gone. |
-| `repair` | Does nothing in this version and says so. Earlier versions changed the lid state and had to undo it; the supervisor still runs this after every helper exit, so an old supervisor script keeps working. |
+| `repair` | Does nothing in this version and says so. Earlier versions changed the lid state and had to undo it after every helper exit; the current supervisor no longer runs it. |
 
 ## Updating, and what happens after app or GooglebookOS updates
 

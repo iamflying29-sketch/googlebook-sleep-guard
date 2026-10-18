@@ -7,7 +7,7 @@
 #   sh start.sh ensure   automatic start (app checks): does nothing if the user stopped it
 #   sh start.sh restart  automatic restart (new app version): does nothing if stopped
 #   sh start.sh status   status (first line "running" / "NOT running"; "STANDING DOWN: ..." if so)
-# The helper's code is taken from the installed Sleep Guard app (APK), falling back to a pushed dex.
+# The helper's code is always taken from the installed Sleep Guard app (APK).
 # Never deletes files: state is kept by overwriting small files.
 D=/data/local/tmp/sleepguard
 PKG=local.sleepguard
@@ -23,18 +23,8 @@ classpath() {
     [ -z "$APK" ] && APK=$(timeout 10 pm path $PKG 2>/dev/null | head -1 | cut -d: -f2)
     if [ -n "$APK" ] && [ -r "$APK" ]; then echo "$APK"; fi
 }
-# Puts the real lid state back: GooglebookOS keeps a dead helper's lid-state override's effect
-# (it would keep seeing a closed lid as open). Harmless when nothing needs repairing. Never while a
-# helper is alive (it would cancel that helper's protection). The APK path is cached only when found.
-CP=""
-repair() {
-    [ -n "$(pids_of "$HLP")" ] && return 0
-    [ -n "$CP" ] && [ -r "$CP" ] || CP=$(classpath)
-    RCP=$CP
-    [ -n "$RCP" ] || RCP=$D/sleepguard.dex   # repair only (cancel our override): the old code does the same
-    CLASSPATH=$RCP timeout -k 5 20 app_process / local.sleepguard.SleepGuard repair >> $D/helper-stdout.log 2>&1 ||
-        slog "lid state repair FAILED"
-}
+# Nothing to put back after a helper exits: this helper holds only wake locks, which GooglebookOS
+# drops with the process. (Older versions changed the lid state and needed a repair step here.)
 alive() { [ -f "$1" ] && p=$(cat "$1") && [ -n "$p" ] && grep -q "$2" /proc/$p/cmdline 2>/dev/null; }
 supervisor_alive() { alive $D/supervisor.pid supervise; }
 helper_alive() { alive $D/helper.pid local.sleepguard.SleepGuard; }
@@ -59,7 +49,6 @@ stop_all() {
     while [ -n "$(pids_of "$HLP")$(pids_of "$SUP")" ] && [ $n -lt 10 ]; do sleep 1; n=$((n + 1)); done
     for p in $(pids_of "$HLP") $(pids_of "$SUP"); do kill -9 $p 2>/dev/null; done
     echo "" > $D/helper.pid
-    repair
 }
 
 # One control action (start/ensure/restart/stop) at a time, from any caller (app, boot, terminal).
@@ -87,7 +76,8 @@ do_start() {   # $1 = start (the user's) | ensure (automatic)
     fi
     if supervisor_alive; then echo "already running"; return; fi
     setsid sh $D/start.sh supervise < /dev/null > /dev/null 2>&1 9>&- &
-    sleep 1
+    n=0
+    while ! supervisor_alive && [ $n -lt 5 ]; do sleep 1; n=$((n + 1)); done
     if supervisor_alive; then echo "started"; else echo "failed to start"; fi
 }
 do_restart() {
@@ -132,7 +122,7 @@ case "$1" in
                 done
                 if [ ! -d /proc/$orphan ]; then
                     slog "the watched helper (pid $orphan) exited"
-                    repair   # it exited (maybe killed): put the real lid state back
+                    echo "" > $D/helper.pid
                 fi
                 continue
             fi
@@ -154,11 +144,10 @@ case "$1" in
             wait $!
             code=$?
             echo "" > $D/helper.pid
-            [ "$(control)" = stop ] && { repair; break; }
+            [ "$(control)" = stop ] && break
             slog "helper exited ($code)"
             ran=$(( $(date +%s) - t0 ))
-            if [ $code = 7 ]; then sleep 30; continue; fi  # another helper runs (no repair: it holds the protection); adopt it next round
-            repair
+            if [ $code = 7 ]; then sleep 30; continue; fi  # another helper runs: adopt it next round
             [ $ran -ge 300 ] && retries=0               # it ran for a while: these are not failures in a row
             if [ $code = 6 ]; then
                 # 6 = something only temporarily unavailable (busy boot, system services restarting):

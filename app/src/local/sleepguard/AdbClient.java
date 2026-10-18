@@ -48,11 +48,11 @@ final class AdbClient implements Closeable {
     /** Connects and completes the TLS handshake with a PKCS#12 key store holding the paired key. */
     static AdbClient connect(String host, int port, byte[] pkcs12, char[] password, int timeoutMs) throws Exception {
         Socket s = new Socket();
-        s.connect(new InetSocketAddress(host, port), timeoutMs);
-        s.setSoTimeout(timeoutMs);
-        s.setTcpNoDelay(true);
         AdbClient c = new AdbClient(s);
         try {
+            s.connect(new InetSocketAddress(host, port), timeoutMs);
+            s.setSoTimeout(timeoutMs);
+            s.setTcpNoDelay(true);
             c.in = new DataInputStream(s.getInputStream());
             c.out = s.getOutputStream();
             c.write(A_CNXN, A_VERSION, MAX_PAYLOAD, "host::\0".getBytes(StandardCharsets.UTF_8));
@@ -106,19 +106,31 @@ final class AdbClient implements Closeable {
 
     /** Runs a command as the shell user and returns its output. */
     private int nextLocalId = 1;
+    /** A whole command, including a supervisor start or stop, must finish within this. */
+    static final long EXEC_DEADLINE_MS = 120_000;
+    static final int EXEC_MAX_OUTPUT = 1024 * 1024;
 
     String exec(String command) throws IOException {
         int local = nextLocalId++; // a fresh stream id per command, so late packets can't mix streams
         write(A_OPEN, local, 0, ("exec:" + command + "\0").getBytes(StandardCharsets.UTF_8));
         ByteArrayOutputStream result = new ByteArrayOutputStream();
         int remote = 0;
+        long deadline = android.os.SystemClock.uptimeMillis() + EXEC_DEADLINE_MS;
         while (true) {
+            if (android.os.SystemClock.uptimeMillis() > deadline) {
+                close(); // the stream is in an unknown state: hang up
+                throw new IOException("the command did not finish within " + (EXEC_DEADLINE_MS / 1000) + " s");
+            }
             Msg m = read();
             if (m.arg1 != local) continue; // belongs to an earlier stream
             if (m.cmd == A_OKAY) {
                 remote = m.arg0;
             } else if (m.cmd == A_WRTE) {
                 remote = m.arg0;
+                if (result.size() + m.data.length > EXEC_MAX_OUTPUT) {
+                    close();
+                    throw new IOException("the command produced more than " + (EXEC_MAX_OUTPUT / 1024) + " KB of output");
+                }
                 result.write(m.data);
                 write(A_OKAY, local, remote, new byte[0]);
             } else if (m.cmd == A_CLSE) {

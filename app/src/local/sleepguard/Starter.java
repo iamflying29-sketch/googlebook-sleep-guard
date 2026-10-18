@@ -139,22 +139,26 @@ final class Starter {
      * another app imitating Wireless debugging on a local port can't pass. Nothing is sent over a
      * connection before this check.
      */
-    static boolean proveShell(Context ctx, AdbClient adb) {
+    static final int PROVEN = 1, NOT_PROVEN = 0, PROOF_FAILED = -1;
+
+    /** PROVEN, NOT_PROVEN (the port answered but is not Android's adb service), or PROOF_FAILED (connection trouble). */
+    static int proveShell(Context ctx, AdbClient adb) {
         String nonce = hex(16);
         try {
             int user = android.os.Process.myUid() / 100000;
             adb.exec("am broadcast --user " + user + " -n " + ctx.getPackageName()
                     + "/.ControlReceiver -a local.sleepguard.PROVE --es nonce " + nonce);
         } catch (Exception e) {
-            return false;
+            Log.i(TAG, "proof could not be sent: " + e);
+            return PROOF_FAILED; // a dropped or slow connection, not an impostor
         }
         long until = android.os.SystemClock.uptimeMillis() + 3000;
         while (android.os.SystemClock.uptimeMillis() < until) {
-            if (ControlReceiver.PROVEN.remove(nonce)) return true;
+            if (ControlReceiver.PROVEN.remove(nonce)) return PROVEN;
             android.os.SystemClock.sleep(50);
         }
-        Log.w(TAG, "an adb port did not prove to be Android's adb service - ignored");
-        return false;
+        Log.w(TAG, "an adb port did not prove to be Android's adb service, so it was ignored");
+        return NOT_PROVEN;
     }
 
     static Result run(Context ctx, Action action) {
@@ -191,7 +195,7 @@ final class Starter {
         byte[] p12 = Files.readAllBytes(keyFile(ctx).toPath());
         char[] pass = prefs(ctx).getString("p12pass", "").toCharArray();
 
-        ensureWirelessDebugging(ctx);
+        ensureWirelessDebugging(ctx, action == Action.PUBLISH);
         if (!wifiConnected(ctx)) {
             // GooglebookOS stops Wireless debugging while Wi-Fi is down (e.g. in deep sleep), whether or
             // not the setting still says on. The helper doesn't need it while running; a check runs as
@@ -211,11 +215,16 @@ final class Starter {
         int port = prefs(ctx).getInt("port", -1);
         if (port > 0) {
             adb = tryConnect(port, p12, pass);
-            if (adb != null && !proveShell(ctx, adb)) {
-                adb.close();
-                adb = null;
-                sawImpostor = true;
-                prefs(ctx).edit().remove("port").apply();
+            if (adb != null) {
+                int proof = proveShell(ctx, adb);
+                if (proof != PROVEN) {
+                    adb.close();
+                    adb = null;
+                    if (proof == NOT_PROVEN) {
+                        sawImpostor = true;
+                        prefs(ctx).edit().remove("port").apply();
+                    }
+                }
             }
         }
         if (adb == null) {
@@ -224,9 +233,10 @@ final class Starter {
                     sawOwnPort = true;
                     AdbClient c = tryConnect(hp[0], p12, pass);
                     if (c == null) continue;
-                    if (!proveShell(ctx, c)) {
+                    int proof = proveShell(ctx, c);
+                    if (proof != PROVEN) {
                         c.close();
-                        sawImpostor = true;
+                        if (proof == NOT_PROVEN) sawImpostor = true;
                         continue;
                     }
                     adb = c;
@@ -250,9 +260,17 @@ final class Starter {
             // The address first: the Linux terminal needs it even if anything below fails.
             String publishProblem = publishPort(ctx, port);
             if (action == Action.PUBLISH) {
+                // A Stop that could not reach the device earlier (no connection then) is carried out now.
+                String st = adb.exec("sh " + DIR + "/start.sh status 0").trim();
+                String stillRunning = "";
+                if (st.startsWith("running")) {
+                    String out = adb.exec("sh " + DIR + "/start.sh stop");
+                    stillRunning = " It was still running and has been stopped now (" + out.trim() + ").";
+                    Log.i(TAG, "stopped the helper that a previous Stop could not reach");
+                }
                 r.ok = publishProblem == null;
                 r.quiet = r.ok;
-                r.summary = r.ok ? stoppedResult().summary : PUBLISH_PROBLEM + " (" + publishProblem + ").";
+                r.summary = (r.ok ? stoppedResult().summary : PUBLISH_PROBLEM + " (" + publishProblem + ").") + stillRunning;
                 return r;
             }
             installScript(ctx, adb);
@@ -271,6 +289,10 @@ final class Starter {
                     break;
                 default:
                     out = adb.exec("sh " + DIR + "/start.sh " + (auto ? "ensure" : "start"));
+            }
+            if (!out.contains("started") && !out.contains("already running") && !out.contains("stopped")
+                    && !out.contains("failed") && !out.contains("in progress")) {
+                prefs(ctx).edit().remove("installedScript").apply(); // the script may be missing or broken: reinstall next time
             }
             if (out.contains("stopped by user")) {
                 prefs(ctx).edit().putBoolean("stopped", true).commit();
@@ -302,7 +324,8 @@ final class Starter {
         return r;
     }
 
-    private static void ensureWirelessDebugging(Context ctx) throws InterruptedException {
+    /** stopped: the user pressed Stop; only the pairing is protected then, nothing is switched on. */
+    private static void ensureWirelessDebugging(Context ctx, boolean stopped) throws InterruptedException {
         try {
             android.content.ContentResolver cr = ctx.getContentResolver();
             // Android forgets every debugging pairing that has not connected for 7 days unless the
@@ -312,6 +335,7 @@ final class Starter {
                 Settings.Global.putLong(cr, "adb_allowed_connection_time", 0);
                 Log.i(TAG, "switched the adb authorization timeout off (keeps Sleep Guard's pairing)");
             }
+            if (stopped) return; // a stopped Sleep Guard leaves the debugging switches alone
             // Only with the user's explicit consent (sleep-guard config usb_debugging on).
             if (prefs(ctx).getBoolean("keepUsbDebugging", false) && Settings.Global.getInt(cr, Settings.Global.ADB_ENABLED, 0) != 1) {
                 Settings.Global.putInt(cr, Settings.Global.ADB_ENABLED, 1);
@@ -439,10 +463,19 @@ final class Starter {
         try (InputStream in = ctx.getAssets().open("start.sh")) {
             script = in.readAllBytes();
         }
+        StringBuilder sb = new StringBuilder();
+        for (byte b : java.security.MessageDigest.getInstance("SHA-256").digest(script)) sb.append(String.format("%02x", b));
+        String digest = sb.toString();
+        // Written once per app version (the device copy is checked against it); not on every check.
+        if (digest.equals(prefs(ctx).getString("installedScript", null))) {
+            String check = adb.exec("sha256sum " + DIR + "/start.sh 2>/dev/null | cut -c1-64").trim();
+            if (digest.equals(check)) return;
+        }
         String b64 = Base64.encodeToString(script, Base64.NO_WRAP);
         String out = adb.exec("mkdir -p " + DIR + " && chmod 700 " + DIR + " && echo " + b64 + " | base64 -d > " + DIR
                 + "/start.sh.new-app && mv " + DIR + "/start.sh.new-app " + DIR + "/start.sh && chmod 700 " + DIR + "/start.sh && echo ok");
         if (!out.trim().endsWith("ok")) throw new Exception("could not install start.sh: " + out);
+        prefs(ctx).edit().putString("installedScript", digest).apply();
     }
 
     /**
@@ -486,7 +519,7 @@ final class Starter {
             }
             try (android.database.Cursor c = cr.query(files, new String[]{android.provider.MediaStore.MediaColumns._ID},
                     android.provider.MediaStore.MediaColumns.RELATIVE_PATH + "=? AND " + android.provider.MediaStore.MediaColumns.DISPLAY_NAME + " LIKE ?",
-                    new String[]{rel, "adb-port%.txt"}, null)) {
+                    new String[]{rel, "adb-port%.txt"}, android.provider.MediaStore.MediaColumns.DATE_MODIFIED + " DESC")) {
                 if (c != null && c.moveToFirst()) uri = android.content.ContentUris.withAppendedId(files, c.getLong(0));
             }
             if (uri == null) {

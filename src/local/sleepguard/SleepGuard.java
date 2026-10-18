@@ -115,7 +115,9 @@ public final class SleepGuard {
             }
             logOut.write(line.getBytes(StandardCharsets.UTF_8));
             if (sync) logOut.getFD().sync(); // survive a sudden power loss
-        } catch (IOException ignored) { }
+        } catch (IOException e) {
+            logOut = null; // reopened at the next line
+        }
     }
 
     static String fingerprint() {
@@ -243,6 +245,9 @@ public final class SleepGuard {
     volatile long heartbeat = SystemClock.uptimeMillis();
     volatile boolean lidResync;          // the lid reader may have missed events (SYN_DROPPED / reopened)
     final java.util.concurrent.atomic.AtomicInteger holdsThisClose = new java.util.concurrent.atomic.AtomicInteger();
+    volatile boolean screenOnShared;     // the main loop's latest screen reading (for the wake detector)
+    int lockFailures;                    // consecutive refused wake-hold locks, under grabLock
+    volatile String lockFailure;         // handled by the main loop: stand down
 
     /** ReflectiveOperationException etc. = an interface changed (stand down); Retry = not available yet. */
     SleepGuard() throws Exception {
@@ -338,7 +343,7 @@ public final class SleepGuard {
         if (!listed) return "Sleep Guard's keep-awake lock is not listed by the power service";
         java.util.regex.Matcher m = java.util.regex.Pattern.compile("PowerManagerService\\.WakeLocks: ref count=(\\d+)").matcher(d);
         if (!m.find()) return "the power service report no longer shows its suspend blockers";
-        if (Integer.parseInt(m.group(1)) < 1) return "the power service is not keeping the laptop awake for Sleep Guard's lock";
+        if (parseInt(m.group(1), 0) < 1) return "the power service is not keeping the laptop awake for Sleep Guard's lock";
         return null;
     }
 
@@ -355,7 +360,15 @@ public final class SleepGuard {
     static int stateFrom(String deviceStateReport, String field) {
         java.util.regex.Matcher m = java.util.regex.Pattern
                 .compile(field + "=Optional\\[DeviceState\\{identifier=(\\d+),").matcher(deviceStateReport);
-        return m.find() ? Integer.parseInt(m.group(1)) : -1;
+        return m.find() ? parseInt(m.group(1), -1) : -1;
+    }
+
+    static int parseInt(String digits, int fallback) {
+        try {
+            return Integer.parseInt(digits);
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 
     /**
@@ -367,7 +380,7 @@ public final class SleepGuard {
         String d = dump("adb");
         if (!d.contains("adb_wifi")) return -1;
         java.util.regex.Matcher m = java.util.regex.Pattern.compile("tls_port=(\\d+)").matcher(d);
-        return m.find() ? Integer.parseInt(m.group(1)) : 0;
+        return m.find() ? parseInt(m.group(1), -1) : 0;
     }
 
     /** The port of a request the app did not confirm (e.g. it was busy being unfrozen): retried. */
@@ -403,7 +416,7 @@ public final class SleepGuard {
     /** Identifier of the DOCKED state (lid closed + external display), -1 if this build has none. */
     static int dockedStateId(String printStates) {
         java.util.regex.Matcher m = java.util.regex.Pattern.compile("identifier=(\\d+), name='DOCKED'").matcher(printStates);
-        return m.find() ? Integer.parseInt(m.group(1)) : -1;
+        return m.find() ? parseInt(m.group(1), -1) : -1;
     }
 
     /**
@@ -478,20 +491,28 @@ public final class SleepGuard {
         long len;
         long real = SystemClock.elapsedRealtime();
         boolean taken = false;
+        long now;
         synchronized (grabLock) {
             long used = 0;
             while (!holdHistory.isEmpty() && real - holdHistory.peekFirst()[0] > HOLD_BUDGET_WINDOW_MS) holdHistory.pollFirst();
             for (long[] h : holdHistory) used += h[1];
             len = used >= HOLD_BUDGET_MS ? GRAB_SHORT_MS : GRAB_MS; // many wakes: still check, just shorter
-            holdHistory.addLast(new long[]{real, len});
+            now = SystemClock.uptimeMillis();
+            // The window first, then the lock, both under grabLock: the main loop's "window over" release
+            // re-checks the window under the same lock, so it can never release a lock taken a moment ago.
+            extendProtection(now + len);
             if (wakeLock == null) {
                 wakeLock = acquireLock("SleepGuard:wake");
                 taken = wakeLock != null;
-                if (taken) lockSince = SystemClock.uptimeMillis();
+                if (taken) {
+                    lockSince = SystemClock.uptimeMillis();
+                    lockFailures = 0;
+                    holdHistory.addLast(new long[]{real, len}); // only real holds count against the budget
+                } else if (++lockFailures >= 5) {
+                    lockFailure = "the keep-awake lock for wake holds keeps being refused";
+                }
             }
         }
-        long now = SystemClock.uptimeMillis();
-        extendProtection(now + len);
         fastUntil = Math.max(fastUntil, now + FAST_MS);
         holdsThisClose.incrementAndGet();
         if (taken) log("holding the laptop awake " + len + " ms (sleep lock): " + why, false);
@@ -525,9 +546,11 @@ public final class SleepGuard {
         }
     }
 
-    void releaseWake(String why) {
+    /** windowOver: release only if the protection window has really ended (checked under the lock). */
+    void releaseWake(String why, boolean windowOver) {
         IBinder b;
         synchronized (grabLock) {
+            if (windowOver && SystemClock.uptimeMillis() < protectUntil) return; // a fresh hold: keep it
             b = wakeLock;
             wakeLock = null;
         }
@@ -548,7 +571,7 @@ public final class SleepGuard {
     void releaseAll(String why) {
         protectEnd.set(0);
         protectUntil = 0;
-        releaseWake(why);
+        releaseWake(why, false);
         releaseSettle();
     }
 
@@ -557,7 +580,7 @@ public final class SleepGuard {
             return (Boolean) isInteractive.invoke(power);
         } catch (Exception e) {
             if (!servicesAlive()) retryLater("GooglebookOS's system services restarted");
-            return true;
+            return screenOnShared; // a passing failure: keep the last reading
         }
     }
 
@@ -636,7 +659,8 @@ public final class SleepGuard {
         while (!exiting) {
             // 5 ms whenever the lid is closed (also while protecting: a deep sleep can start right
             // after a window ends, and the rest of a longer sleep would run only after the next wake).
-            SystemClock.sleep(started && lidClosed ? DETECT_MS : 100);
+            // Not while the screen is on (e.g. docked with the lid closed): the laptop is in use then.
+            SystemClock.sleep(started && lidClosed && !screenOnShared ? DETECT_MS : 100);
             long off = sleepOffset();
             if (off - last > 20 && started && !exiting && lidClosed && wakeLock == null && settleLock == null) {
                 startGrab("woke from deep sleep with the lid closed");
@@ -758,7 +782,7 @@ public final class SleepGuard {
             if (lidEvent) fastUntil = Math.max(fastUntil, now + FAST_MS);
             final boolean fast = now < fastUntil;
             final boolean grabbing = now < protectUntil && settleLock == null && wakeLock != null;
-            if (now - lastPollAt >= (grabbing ? POLL_GRAB_MS : fast ? POLL_FAST_MS : (!lid && screenOn) ? POLL_IN_USE_MS : POLL_MS)) {
+            if (now - lastPollAt >= (grabbing ? POLL_GRAB_MS : fast ? POLL_FAST_MS : screenOn ? POLL_IN_USE_MS : POLL_MS)) {
                 lastPollAt = now;
                 Boolean cc = chargerConnected();
                 if (cc != null) {
@@ -770,10 +794,15 @@ public final class SleepGuard {
                     retryLater("the battery report has been unavailable for a minute");
                 }
                 screenOn = interactive();
+                screenOnShared = screenOn;
                 now = SystemClock.uptimeMillis();
             }
 
             if (lidReaderFailed) standDown("the lid switch can't be read any more", this);
+            if (lockFailure != null) {
+                if (!servicesAlive()) retryLater("GooglebookOS's system services restarted");
+                standDown(lockFailure, this);
+            }
             if (lidResync) {
                 // Events may have been lost: GooglebookOS's own lid state is the truth.
                 lidResync = false;
@@ -821,8 +850,8 @@ public final class SleepGuard {
             }
 
             final boolean protecting = now < protectUntil;
-            if (!protecting && wakeLock != null) releaseWake("normal lid-closed sleep");
-            if (lidEvent && !lid && wakeLock != null) releaseWake("lid opened");
+            if (!protecting && wakeLock != null) releaseWake("normal lid-closed sleep", true);
+            if (lidEvent && !lid && wakeLock != null) releaseWake("lid opened", false);
             if (settleLock != null && now >= settleUntil) releaseSettle();
 
             // Live check once per lid-closed window: GooglebookOS must really keep the laptop awake

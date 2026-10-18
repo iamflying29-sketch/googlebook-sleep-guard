@@ -28,10 +28,10 @@ public class MainActivity extends Activity {
         title.setTextSize(22);
         root.addView(title);
         TextView about = new TextView(this);
-        about.setText("Sleep Guard keeps deep sleep, but it gives the USB-C charging chip time to finish whenever the charger "
-                + "is plugged in or unplugged while the laptop sleeps, so the laptop no longer turns itself off. It starts by "
-                + "itself after every reboot, checks itself every 15 minutes, and stands down safely (the laptop then behaves "
-                + "normally) if a GooglebookOS update changes anything it relies on.");
+        about.setText("Keeps deep sleep, but gives the USB-C charging chip time to finish whenever the charger is plugged in "
+                + "or unplugged while the laptop sleeps, so it no longer turns itself off. Starts by itself after every reboot, "
+                + "checks itself every 15 minutes, and stands down safely (normal behaviour) if a GooglebookOS update changes "
+                + "anything it relies on.");
         about.setPadding(0, pad / 2, 0, pad);
         root.addView(about);
         summary = new TextView(this);

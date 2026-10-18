@@ -22,7 +22,7 @@ public class HealthJob extends JobService {
      * A check was requested while one was already running (e.g. Wireless debugging moved to yet
      * another port during the check): run once more when it finishes, so the newest port is published.
      */
-    static final java.util.concurrent.atomic.AtomicBoolean RERUN = new java.util.concurrent.atomic.AtomicBoolean();
+    static final java.util.Set<Integer> RERUN = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /**
      * Wakes this app the moment Wireless debugging, USB debugging or Developer options are switched,
@@ -79,7 +79,7 @@ public class HealthJob extends JobService {
         // A running check already does the work (and re-scheduling its id would cancel it); it runs
         // once more afterwards, in case what it found is already outdated.
         if (RUNNING.contains(id)) {
-            if (id == NOW) RERUN.set(true);
+            RERUN.add(id);
             return;
         }
         if (!fresh && js.getPendingJob(id) != null) return;
@@ -100,6 +100,12 @@ public class HealthJob extends JobService {
                 boolean trigger = id == SETTINGS_CHANGED || id == SETTINGS_CHANGED_B;
                 if (trigger) {
                     armOtherTrigger(this, id);
+                    // The app's own switch-on of Wireless debugging fires this trigger too: nothing to do then.
+                    long ownWrite = System.currentTimeMillis() - Starter.prefs(this).getLong("wifiAssertAt", 0);
+                    if (Starter.adbWifi(this) == 1 && ownWrite >= 0 && ownWrite < 20_000) {
+                        Log.i(Starter.TAG, "health job " + id + ": triggered by Sleep Guard's own setting write, skipped");
+                        return;
+                    }
                     android.os.SystemClock.sleep(3000); // let adbd settle after the switch
                 }
                 if (id == NETWORK_BACK) android.os.SystemClock.sleep(3000); // let Wi-Fi finish connecting
@@ -121,7 +127,7 @@ public class HealthJob extends JobService {
             } finally {
                 RUNNING.remove(id);
                 jobFinished(params, retry);
-                if (id == NOW && RERUN.getAndSet(false)) schedule(this, false, false);
+                if (RERUN.remove(id) && (id == NOW || id == RESTART)) schedule(this, id == RESTART, false);
             }
         }, "health-job").start();
         return true;

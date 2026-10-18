@@ -33,7 +33,7 @@ DIR=/data/local/tmp/sleepguard
 DOCS="${SLEEP_GUARD_PORT_DIR:-/mnt/shared/Documents/Sleep Guard}"
 FORCE=0
 for a in "$@"; do [ "$a" = "--force" ] && FORCE=1; done
-sgadb() { HOME=$H adb "$@"; }
+sgadb() { HOME=$H timeout 120 adb "$@"; }   # every adb call is bounded (nothing may hang the terminal)
 
 key_secret() {
     [ -r "$KEYDIR/adbkey" ] || return 1
@@ -68,14 +68,24 @@ keep_pairing() {
 }
 need_device() {
     DEV=$(connected || true)
+    local pub="" res="" age=""
     if [ -z "$DEV" ]; then
-        local pub; pub=$(published)
-        [ -n "$pub" ] && sgadb connect "$pub" >/dev/null 2>&1 || true
+        pub=$(published)
+        if [ -n "$pub" ]; then
+            # A stale "offline" entry for the same address would make connect answer "already connected".
+            sgadb disconnect "$pub" >/dev/null 2>&1 || true
+            res=$(sgadb connect "$pub" 2>&1 | tail -1 || true)
+        fi
         sleep 1
         DEV=$(connected || true)
     fi
     if [ -z "$DEV" ]; then
         echo "Sleep Guard is not connected to the Googlebook." >&2
+        if [ -n "$pub" ]; then
+            for f in "$DOCS"/adb-port*.txt; do [ -r "$f" ] && age=$(( ($(date +%s) - $(stat -c %Y "$f")) / 60 )); done
+            echo "The address the Sleep Guard app published ($pub, ${age:-?} minutes ago) did not answer: $res" >&2
+            case "$res" in *auth*|*key*|*unauthorized*) echo "That looks like a lost pairing: run  sleep-guard pair CODE IP:PAIRPORT  with a new pairing code." >&2 ;; esac
+        fi
         echo "Make sure Wireless debugging is on, then: sleep-guard connect IP:PORT (shown on the Wireless debugging screen)" >&2
         exit 1
     fi
@@ -181,7 +191,7 @@ case "${1:-status}" in
     log)    need_device; ash "tail -n ${2:-60} $DIR/sleepguard.log" ;;
     check)
         need_device
-        ash "A=\$(pm path --user current $APP 2>/dev/null | head -1 | cut -d: -f2); [ -r \"\$A\" ] || A=$DIR/sleepguard.dex; CLASSPATH=\$A app_process / local.sleepguard.SleepGuard check"
+        ash "A=\$(pm path --user current $APP 2>/dev/null | head -1 | cut -d: -f2); [ -r \"\$A\" ] || { echo 'the Sleep Guard app is not installed (run: sleep-guard install-app)'; exit 1; }; CLASSPATH=\$A timeout 60 app_process / local.sleepguard.SleepGuard check"
         ;;
     usb-debugging)
         need_device

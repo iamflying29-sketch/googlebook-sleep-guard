@@ -15,18 +15,25 @@ umask 077
 mkdir -p $D
 chmod 700 $D 2>/dev/null
 
+slog() { echo "$(date '+%m-%d %H:%M:%S') supervisor: $*" >> $D/sleepguard.log; }
+# The installed Sleep Guard app's APK (the helper's code); empty if the package manager has no answer
+# right now. The helper is never run from the old pushed dex: that would silently run outdated code.
 classpath() {
-    APK=$(timeout 20 pm path --user current $PKG 2>/dev/null | head -1 | cut -d: -f2)
-    [ -z "$APK" ] && APK=$(timeout 20 pm path $PKG 2>/dev/null | head -1 | cut -d: -f2)
-    if [ -n "$APK" ] && [ -r "$APK" ]; then echo "$APK"; else echo "$D/sleepguard.dex"; fi
+    APK=$(timeout 10 pm path --user current $PKG 2>/dev/null | head -1 | cut -d: -f2)
+    [ -z "$APK" ] && APK=$(timeout 10 pm path $PKG 2>/dev/null | head -1 | cut -d: -f2)
+    if [ -n "$APK" ] && [ -r "$APK" ]; then echo "$APK"; fi
 }
 # Puts the real lid state back: GooglebookOS keeps a dead helper's lid-state override's effect
-# (it would keep seeing a closed lid as open). Harmless when nothing needs repairing.
+# (it would keep seeing a closed lid as open). Harmless when nothing needs repairing. Never while a
+# helper is alive (it would cancel that helper's protection). The APK path is cached only when found.
 CP=""
 repair() {
+    [ -n "$(pids_of "$HLP")" ] && return 0
     [ -n "$CP" ] && [ -r "$CP" ] || CP=$(classpath)
-    CLASSPATH=$CP timeout 20 app_process / local.sleepguard.SleepGuard repair >> $D/helper-stdout.log 2>&1 ||
-        echo "$(date '+%m-%d %H:%M:%S') supervisor: lid state repair FAILED" >> $D/sleepguard.log
+    RCP=$CP
+    [ -n "$RCP" ] || RCP=$D/sleepguard.dex   # repair only (cancel our override): the old code does the same
+    CLASSPATH=$RCP timeout -k 5 20 app_process / local.sleepguard.SleepGuard repair >> $D/helper-stdout.log 2>&1 ||
+        slog "lid state repair FAILED"
 }
 alive() { [ -f "$1" ] && p=$(cat "$1") && [ -n "$p" ] && grep -q "$2" /proc/$p/cmdline 2>/dev/null; }
 supervisor_alive() { alive $D/supervisor.pid supervise; }
@@ -44,6 +51,7 @@ HLP="app_process / local.sleepguard.SleepGuard"
 pids_of() { ps -A -o PID,ARGS 2>/dev/null | sed 1d | while read -r p a; do [ "$a" = "$1" ] && echo "$p"; done; }
 
 stop_all() {
+    [ -n "$(pids_of "$SUP")$(pids_of "$HLP")" ] && slog "stopping (sh start.sh $1)"
     echo "" > $D/supervisor.pid                       # a supervisor that is still alive exits on seeing this
     for p in $(pids_of "$SUP"); do kill $p 2>/dev/null; done
     for p in $(pids_of "$HLP"); do kill $p 2>/dev/null; done   # the system drops a dead helper's override + wakelocks
@@ -75,7 +83,7 @@ do_start() {   # $1 = start (the user's) | ensure (automatic)
         was_down=0; standing_down && was_down=1
         echo run > $D/control
         echo none > $D/standdown     # the user's start also retries after a stand-down
-        [ $was_down = 1 ] && stop_all # replace a supervisor napping after the stand-down: retry now
+        [ $was_down = 1 ] && stop_all "$1" # replace a supervisor napping after the stand-down: retry now
     fi
     if supervisor_alive; then echo "already running"; return; fi
     setsid sh $D/start.sh supervise < /dev/null > /dev/null 2>&1 9>&- &
@@ -84,12 +92,13 @@ do_start() {   # $1 = start (the user's) | ensure (automatic)
 }
 do_restart() {
     [ "$(control)" = stop ] && { echo "stopped by user"; return; }
-    stop_all
+    echo none > $D/standdown     # a new app version may fix what the helper stood down for: try again
+    stop_all restart
     do_start ensure
 }
 do_stop() {
     echo stop > $D/control
-    stop_all
+    stop_all stop
     echo "stopped"
 }
 
@@ -117,10 +126,22 @@ case "$1" in
             orphan=$(pids_of "$HLP" | head -1)
             if [ -n "$orphan" ]; then
                 echo "$orphan" > $D/helper.pid
+                slog "watching the helper that is already running (pid $orphan)"
                 while [ -d /proc/$orphan ] && [ "$(control)" != stop ] && [ "$(cat $D/supervisor.pid 2>/dev/null)" = "$$" ]; do
                     sleep 1
                 done
-                [ -d /proc/$orphan ] || repair   # it exited (maybe killed): put the real lid state back
+                if [ ! -d /proc/$orphan ]; then
+                    slog "the watched helper (pid $orphan) exited"
+                    repair   # it exited (maybe killed): put the real lid state back
+                fi
+                continue
+            fi
+            CP=$(classpath)
+            if [ -z "$CP" ]; then
+                # The package manager has no answer (busy boot, system services restarting): wait, never
+                # run outdated code instead.
+                slog "the Sleep Guard app's code is not available right now; trying again in 30 s"
+                sleep 30
                 continue
             fi
             # Keep the logs small (the older half is kept as .1).
@@ -128,28 +149,31 @@ case "$1" in
                 if [ -f $D/$f ] && [ "$(stat -c %s $D/$f)" -gt 2000000 ]; then mv $D/$f $D/$f.1; fi
             done
             t0=$(date +%s)
-            CLASSPATH=$(classpath) app_process / local.sleepguard.SleepGuard >> $D/helper-stdout.log 2>&1 &
+            CLASSPATH=$CP app_process / local.sleepguard.SleepGuard >> $D/helper-stdout.log 2>&1 &
             echo $! > $D/helper.pid
             wait $!
             code=$?
             echo "" > $D/helper.pid
-            repair
-            [ "$(control)" = stop ] && break
-            echo "$(date '+%m-%d %H:%M:%S') supervisor: helper exited ($code)" >> $D/sleepguard.log
+            [ "$(control)" = stop ] && { repair; break; }
+            slog "helper exited ($code)"
             ran=$(( $(date +%s) - t0 ))
-            if [ $code = 7 ]; then sleep 2; continue; fi   # another helper runs: adopt it next round (not a failure)
+            if [ $code = 7 ]; then sleep 30; continue; fi  # another helper runs (no repair: it holds the protection); adopt it next round
+            repair
+            [ $ran -ge 300 ] && retries=0               # it ran for a while: these are not failures in a row
             if [ $code = 6 ]; then
                 # 6 = something only temporarily unavailable (busy boot, system services restarting):
-                # retry every 30 s; give up after ~20 tries in a row.
+                # retry every 30 s; after ~20 tries in a row only once an hour (never give up for good:
+                # the condition is temporary by definition).
                 retries=$((retries + 1))
                 if [ $retries -ge 20 ]; then
-                    echo "STANDING DOWN: what Sleep Guard needs stayed unavailable for a long time | build=$(getprop ro.build.fingerprint)" > $D/standdown
-                    retries=0
+                    slog "what Sleep Guard needs has been unavailable for a long time; trying again every hour"
+                    sleep 3600
+                    retries=10
+                else
+                    sleep 30
                 fi
-                sleep 30
                 continue
             fi
-            [ $ran -ge 300 ] && retries=0
             if [ $ran -lt 30 ]; then fails=$((fails + 1)); else fails=0; fi
             if [ $fails -ge 10 ]; then
                 # Keeps failing right after starting: stop retrying until the next update or 'start'

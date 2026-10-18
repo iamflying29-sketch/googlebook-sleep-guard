@@ -18,6 +18,11 @@ public class HealthJob extends JobService {
 
     /** Jobs currently running in this process (re-scheduling a running job's id would cancel it). */
     static final java.util.Set<Integer> RUNNING = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /**
+     * A check was requested while one was already running (e.g. Wireless debugging moved to yet
+     * another port during the check): run once more when it finishes, so the newest port is published.
+     */
+    static final java.util.concurrent.atomic.AtomicBoolean RERUN = new java.util.concurrent.atomic.AtomicBoolean();
 
     /**
      * Wakes this app the moment Wireless debugging, USB debugging or Developer options are switched,
@@ -71,8 +76,12 @@ public class HealthJob extends JobService {
             js.schedule(new JobInfo.Builder(PERIODIC, cn).setPeriodic(15 * 60 * 1000L).setPersisted(true).build());
         }
         int id = restart ? RESTART : NOW;
-        // A running check already does the work (and re-scheduling its id would cancel it).
-        if (RUNNING.contains(id)) return;
+        // A running check already does the work (and re-scheduling its id would cancel it); it runs
+        // once more afterwards, in case what it found is already outdated.
+        if (RUNNING.contains(id)) {
+            if (id == NOW) RERUN.set(true);
+            return;
+        }
         if (!fresh && js.getPendingJob(id) != null) return;
         if (fresh) Starter.prefs(c).edit().putInt("startFails", 0).apply();
         android.os.PersistableBundle extras = new android.os.PersistableBundle();
@@ -112,6 +121,7 @@ public class HealthJob extends JobService {
             } finally {
                 RUNNING.remove(id);
                 jobFinished(params, retry);
+                if (id == NOW && RERUN.getAndSet(false)) schedule(this, false, false);
             }
         }, "health-job").start();
         return true;

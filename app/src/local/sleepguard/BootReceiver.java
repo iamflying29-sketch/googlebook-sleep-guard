@@ -12,6 +12,9 @@ public class BootReceiver extends BroadcastReceiver {
         // another app might send here explicitly is ignored.
         String action = intent.getAction();
         if (Intent.ACTION_BOOT_COMPLETED.equals(action)) {
+            // Wireless debugging is off after a reboot: switch it back on at once (not after the
+            // 10-minute pause that applies to a switch-off by hand).
+            Starter.prefs(context).edit().putBoolean("wifiDropped", true).commit();
             HealthJob.schedule(context, false, true);
         } else if (Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)) {
             // After an app update the running helper still has the old code: restart it.

@@ -68,6 +68,9 @@ public class ControlReceiver extends BroadcastReceiver {
             setResultData("keepUsbDebugging=" + Starter.prefs(context).getBoolean("keepUsbDebugging", false)
                     + " stopped=" + Starter.prefs(context).getBoolean("stopped", false) + proof);
         } else if ("local.sleepguard.KICK".equals(action)) {
+            // The helper saw Wireless debugging's current port: try it first (no discovery needed).
+            int port = intent.getIntExtra("port", 0);
+            if (port > 0 && port < 65536) Starter.prefs(context).edit().putInt("port", port).apply();
             HealthJob.schedule(context, intent.getBooleanExtra("restart", false), true);
             setResultData("kicked");
         } else if ("local.sleepguard.ALERT".equals(action)) {

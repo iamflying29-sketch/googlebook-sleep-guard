@@ -39,7 +39,8 @@ final class Starter {
     private static final int NOTIF_PROBLEM = 1, NOTIF_ALERT = 2;
     private static final Object LOCK = new Object();
 
-    enum Action { ENSURE, RESTART, STOP }
+    /** PUBLISH: while the user has stopped Sleep Guard, only keep the published address current. */
+    enum Action { ENSURE, RESTART, STOP, PUBLISH }
 
     static final class Result {
         boolean ok;
@@ -47,6 +48,9 @@ final class Starter {
         String summary = "";
         String status = "";
     }
+
+    /** What the Linux script would tell the user when it reads a stale address. */
+    private static final String PUBLISH_PROBLEM = "The address file for the Linux terminal (Documents/Sleep Guard/adb-port.txt) could not be written";
 
     static SharedPreferences prefs(Context c) {
         return c.getSharedPreferences("state", Context.MODE_PRIVATE);
@@ -112,7 +116,9 @@ final class Starter {
 
     /** Routine check (boot, every 15 min, debugging switched): make sure the helper runs. */
     static Result check(Context ctx) {
-        if (prefs(ctx).getBoolean("stopped", false)) return stoppedResult();
+        // Stopped by the user: the helper (which notices port changes) is not running, so the routine
+        // checks keep the published Wireless debugging address current; nothing is started.
+        if (prefs(ctx).getBoolean("stopped", false)) return run(ctx, Action.PUBLISH, true);
         return run(ctx, Action.ENSURE, true);
     }
 
@@ -147,7 +153,7 @@ final class Starter {
             if (ControlReceiver.PROVEN.remove(nonce)) return true;
             android.os.SystemClock.sleep(50);
         }
-        Log.w(TAG, "an adb port did not prove to be Android's adb service, so it was ignored");
+        Log.w(TAG, "an adb port did not prove to be Android's adb service - ignored");
         return false;
     }
 
@@ -158,7 +164,8 @@ final class Starter {
     /** auto=true: automatic check; re-reads the user's Stop under the lock so it never overrides it. */
     static Result run(Context ctx, Action action, boolean auto) {
         synchronized (LOCK) {
-            if (auto && prefs(ctx).getBoolean("stopped", false)) return stoppedResult();
+            if (auto && action != Action.PUBLISH && prefs(ctx).getBoolean("stopped", false)) return stoppedResult();
+            if (action == Action.PUBLISH && !prefs(ctx).getBoolean("stopped", false)) action = Action.ENSURE; // started meanwhile
             if (!auto) prefs(ctx).edit().putBoolean("stopped", action == Action.STOP).commit();
             Result r = new Result();
             try {
@@ -185,15 +192,18 @@ final class Starter {
         char[] pass = prefs(ctx).getString("p12pass", "").toCharArray();
 
         ensureWirelessDebugging(ctx);
+        if (!wifiConnected(ctx)) {
+            // GooglebookOS stops Wireless debugging while Wi-Fi is down (e.g. in deep sleep), whether or
+            // not the setting still says on. The helper doesn't need it while running; a check runs as
+            // soon as Wi-Fi returns (and the helper reports the new port).
+            HealthJob.armNetworkTrigger(ctx);
+            r.quiet = true;
+            r.summary = "Waiting for Wi-Fi (Wireless debugging needs it). Sleep Guard keeps running meanwhile.";
+            return r;
+        }
         if (adbWifi(ctx) != 1) {
-            if (!wifiConnected(ctx)) {
-                // GooglebookOS turns Wireless debugging off while Wi-Fi is down (e.g. in deep sleep). The
-                // helper doesn't need it while running; this app turns it back on when Wi-Fi returns.
-                r.quiet = true;
-                r.summary = "Waiting for Wi-Fi (Wireless debugging needs it). Sleep Guard keeps running meanwhile.";
-            } else {
-                r.summary = "Wireless debugging is off and could not be switched on. It can be switched on in Developer options.";
-            }
+            r.quiet = action == Action.PUBLISH;
+            r.summary = "Wireless debugging is off and could not be switched on. It can be switched on in Developer options.";
             return r;
         }
         AdbClient adb = null;
@@ -227,6 +237,7 @@ final class Starter {
             }
         }
         if (adb == null) {
+            r.quiet = action == Action.PUBLISH; // stopped by the user: nothing to fix right now
             r.summary = sawImpostor
                     ? "Something on this Googlebook imitates Wireless debugging (it couldn't prove it is Android's adb service), so nothing was sent to it."
                     : sawOwnPort
@@ -236,8 +247,15 @@ final class Starter {
         }
         prefs(ctx).edit().putInt("port", port).apply();
         try {
+            // The address first: the Linux terminal needs it even if anything below fails.
+            String publishProblem = publishPort(ctx, port);
+            if (action == Action.PUBLISH) {
+                r.ok = publishProblem == null;
+                r.quiet = r.ok;
+                r.summary = r.ok ? stoppedResult().summary : PUBLISH_PROBLEM + " (" + publishProblem + ").";
+                return r;
+            }
             installScript(ctx, adb);
-            publishPort(ctx, port);
             String out;
             switch (action) {
                 case STOP:
@@ -274,6 +292,10 @@ final class Starter {
                 r.ok = running;
                 r.summary = running ? "Sleep Guard is running." : "Sleep Guard did not start: " + out.trim();
             }
+            if (publishProblem != null && action != Action.STOP) {
+                r.ok = false; // visible: the Linux terminal would keep using a stale address
+                r.summary += " " + PUBLISH_PROBLEM + " (" + publishProblem + ").";
+            }
         } finally {
             adb.close();
         }
@@ -282,9 +304,17 @@ final class Starter {
 
     private static void ensureWirelessDebugging(Context ctx) throws InterruptedException {
         try {
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            // Android forgets every debugging pairing that has not connected for 7 days unless the
+            // developer option "Disable adb authorization timeout" is on (this setting = 0). That removed
+            // this app's pairing on 2026-10-17; keep the option on (read first: no needless writes).
+            if (Settings.Global.getLong(cr, "adb_allowed_connection_time", -1) != 0) {
+                Settings.Global.putLong(cr, "adb_allowed_connection_time", 0);
+                Log.i(TAG, "switched the adb authorization timeout off (keeps Sleep Guard's pairing)");
+            }
             // Only with the user's explicit consent (sleep-guard config usb_debugging on).
-            if (prefs(ctx).getBoolean("keepUsbDebugging", false)) {
-                Settings.Global.putInt(ctx.getContentResolver(), Settings.Global.ADB_ENABLED, 1);
+            if (prefs(ctx).getBoolean("keepUsbDebugging", false) && Settings.Global.getInt(cr, Settings.Global.ADB_ENABLED, 0) != 1) {
+                Settings.Global.putInt(cr, Settings.Global.ADB_ENABLED, 1);
             }
             if (adbWifi(ctx) == 1) {
                 prefs(ctx).edit().putBoolean("wifiDropped", false).apply();
@@ -420,7 +450,7 @@ final class Starter {
      * MediaStore), where the Linux terminal's sleep-guard script finds it after a reboot. Signed
      * with the secret only this app and that script share.
      */
-    private static void publishPort(Context ctx, int port) {
+    private static String publishPort(Context ctx, int port) {
         try {
             String ip = null;
             for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
@@ -429,20 +459,26 @@ final class Starter {
                     if (a instanceof java.net.Inet4Address) ip = a.getHostAddress();
             }
             String addr = (ip == null ? "" : ip) + ":" + port;
-            // Unchanged address (IP and port) = nothing to write.
-            if (addr.equals(prefs(ctx).getString("publishedAddr", null)) && prefs(ctx).getString("portUri", null) != null) return;
-            String text = addr + " " + keyMac(ctx, "port:" + addr) + "\n";
             android.content.ContentResolver cr = ctx.getContentResolver();
+            String saved = prefs(ctx).getString("portUri", null);
+            // The file written last time must still exist under its name (the user may have deleted or
+            // renamed it): one small query.
+            if (saved != null && !"adb-port.txt".equals(displayName(cr, android.net.Uri.parse(saved)))) {
+                prefs(ctx).edit().remove("portUri").apply();
+                saved = null;
+            }
+            // Unchanged address (IP and port) in an existing file = nothing to write.
+            if (addr.equals(prefs(ctx).getString("publishedAddr", null)) && saved != null) return null;
+            String text = addr + " " + keyMac(ctx, "port:" + addr) + "\n";
             android.net.Uri files = android.provider.MediaStore.Files.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY);
             String rel = android.os.Environment.DIRECTORY_DOCUMENTS + "/Sleep Guard/";
             android.net.Uri uri = null;
-            String saved = prefs(ctx).getString("portUri", null);
             if (saved != null) {
                 try (java.io.OutputStream out = cr.openOutputStream(android.net.Uri.parse(saved), "wt")) {
                     if (out != null) {
                         out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                         prefs(ctx).edit().putString("publishedAddr", addr).apply();
-                        return;
+                        return null;
                     }
                 } catch (Exception e) {
                     prefs(ctx).edit().remove("portUri").apply();
@@ -460,13 +496,24 @@ final class Starter {
                 v.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, rel);
                 uri = cr.insert(files, v);
             }
-            if (uri == null) return;
+            if (uri == null) return "the Documents folder refused a new file";
             try (java.io.OutputStream out = cr.openOutputStream(uri, "wt")) {
                 out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             }
             prefs(ctx).edit().putString("portUri", uri.toString()).putString("publishedAddr", addr).apply();
+            return null;
         } catch (Exception e) {
-            Log.i(TAG, "publishPort: " + e);
+            Log.w(TAG, "publishPort: " + e);
+            return String.valueOf(e);
+        }
+    }
+
+    /** The current file name of a MediaStore row (null if the row is gone). */
+    private static String displayName(android.content.ContentResolver cr, android.net.Uri uri) {
+        try (android.database.Cursor c = cr.query(uri, new String[]{android.provider.MediaStore.MediaColumns.DISPLAY_NAME}, null, null, null)) {
+            return c != null && c.moveToFirst() ? c.getString(0) : null;
+        } catch (Exception e) {
+            return null;
         }
     }
 

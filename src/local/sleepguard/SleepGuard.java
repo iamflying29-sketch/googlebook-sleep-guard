@@ -571,6 +571,12 @@ public final class SleepGuard {
      * running with the lid open continues with the ordinary wakelock (it never blocks a wake-up).
      */
     void userWoke(String what, int reason, boolean onlyWhenAsleep) {
+        // Keys, buttons and mouse motion count only when GooglebookOS itself would wake on them: with the
+        // lid open (no sleep lock is ever held then) or docked. With the lid simply closed it does not act
+        // on them, so releasing the lock would only lose the protection. And such events do occur without
+        // the user: on 2026-10-19 02:02:38 the ACPI "Power Button" device reported a press in the very
+        // millisecond of a charger wake, which, taken for a real press, defeated the hold and the settle.
+        if (onlyWhenAsleep && lidClosed && !docked) return;
         boolean held;
         synchronized (grabLock) {
             held = wakeLock != null || (settleLock != null && settleLevel == PARTIAL_SLEEP_WAKE_LOCK);
@@ -789,7 +795,10 @@ public final class SleepGuard {
                 // Not the firmware's pseudo devices (the ACPI "Video Bus" and the audio jacks report display and
                 // jack changes on their own; a wake from them would not be the user's), and not touch devices
                 // (the trackpad and the touchscreen cannot be used with the lid closed, and they would stream events).
-                if (dev != null && keys && !touch && !name.equals("Video Bus") && !name.contains("Jack") && !name.contains("HDMI"))
+                // Nor the ACPI "Power Button" device: the firmware makes it report a press on some resumes
+                // (2026-10-19 02:02:38); the EC's own cros_ec_buttons device reports the physical button.
+                if (dev != null && keys && !touch && !name.equals("Video Bus") && !name.equals("Power Button")
+                        && !name.contains("Jack") && !name.contains("HDMI"))
                     r.add(dev + "\t" + name);
                 dev = m.group(1); name = "?"; keys = false; touch = false;
             } else if (dev != null && line.trim().startsWith("name:")) {
@@ -857,7 +866,8 @@ public final class SleepGuard {
                     int type = bb.getShort(16) & 0xffff, code = bb.getShort(18) & 0xffff, value = bb.getInt(20);
                     if (type == 1 /* EV_KEY */ && value == 1) {
                         // Docked (lid closed, external display): GooglebookOS wakes on keys, so repeat a refused
-                        // wake there too. With the lid simply closed it does not wake on keys, and neither do we.
+                        // wake there too. Power button presses are rare and are logged for the record.
+                        if (code == KEY_POWER) log("power button press seen on " + name + (lidClosed ? " (lid closed)" : ""), false);
                         if (code == KEY_POWER) userWoke("the power button was pressed", WAKE_REASON_POWER_BUTTON, !docked);
                         else userWoke("a key was pressed (" + name + ")", WAKE_REASON_WAKE_KEY, !docked);
                     } else if (type == 2 /* EV_REL: a mouse moved */) {

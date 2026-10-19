@@ -101,7 +101,7 @@ need_device() {
 }
 ash() { sgadb -s "$DEV" shell "$@"; }
 # The supervisor script bundled with the current app build (the app installs the same one on each
-# of its runs - but not while Sleep Guard is stopped, so start/stop install it themselves first).
+# of its runs, but not while Sleep Guard is stopped, so start and stop install it themselves first).
 install_script() {
     local s="$APP_SRC/assets/start.sh"             # copied there by app/build.sh
     [ -r "$s" ] || s="$REPO/device/start.sh"       # not built yet: the same script from the source

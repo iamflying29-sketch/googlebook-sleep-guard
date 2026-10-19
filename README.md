@@ -112,7 +112,8 @@ removes all of that. Sleep Guard now never touches the lid state.
    new devices when the lid closes and when a lid-closed settle starts; the trackpad and the touchscreen are left
    out because they cannot be used with the lid closed), so it always knows when you want the laptop awake. When
    the lid opens, or any key or button is pressed or a mouse moved while the laptop is asleep and the sleep lock is
-   held, the lock is released at once, and the helper then checks that the screen is
+   held, the lock is released at once (for mouse motion the helper only releases, and leaves the decision to wake to
+   GooglebookOS), and the helper then checks that the screen is
    coming on; if GooglebookOS's own wake request was refused during the hold, the helper asks the power manager to
    wake the laptop (the adb shell user holds the `DEVICE_POWER` permission this needs). A settle that was running
    goes on with an ordinary wakelock.

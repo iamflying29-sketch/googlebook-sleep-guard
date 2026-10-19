@@ -96,6 +96,7 @@ public class HealthJob extends JobService {
         RUNNING.add(id);
         new Thread(() -> {
             boolean retry = false;
+            Starter.Result r = null;
             try {
                 boolean trigger = id == SETTINGS_CHANGED || id == SETTINGS_CHANGED_B;
                 if (trigger) {
@@ -111,8 +112,13 @@ public class HealthJob extends JobService {
                 if (id == NETWORK_BACK) android.os.SystemClock.sleep(3000); // let Wi-Fi finish connecting
                 // An automatic restart (new app version) never overrides the user's Stop.
                 boolean restart = params.getExtras().getBoolean("restart", false);
-                Starter.Result r = restart ? Starter.run(this, Starter.Action.RESTART, true) : Starter.check(this);
-                Log.i(Starter.TAG, "health job " + id + ": " + r.summary);
+                do {
+                    // A check requested while this one ran (the port moved again) is done right here, in the
+                    // same job: scheduling it after jobFinished could be lost (the finished job may still be
+                    // listed for a moment, and the request may arrive just as this thread ends).
+                    r = restart ? Starter.run(this, Starter.Action.RESTART, true) : Starter.check(this);
+                    Log.i(Starter.TAG, "health job " + id + ": " + r.summary);
+                } while ((id == NOW || id == RESTART) && RERUN.remove(id));
                 // Failed one-off starts (e.g. Wi-Fi not up yet after boot) retry with back-off, at most
                 // 6 times in a row; after that the 15-minute periodic check keeps trying, quietly.
                 if (r.ok) {
@@ -127,7 +133,9 @@ public class HealthJob extends JobService {
             } finally {
                 RUNNING.remove(id);
                 jobFinished(params, retry);
-                if (RERUN.remove(id) && (id == NOW || id == RESTART)) schedule(this, id == RESTART, false);
+                // Wi-Fi dropped again during the Wi-Fi job itself: the trigger could not be re-armed while
+                // this job counted as running, so arm it now.
+                if (id == NETWORK_BACK && r != null && r.summary.startsWith("Waiting for Wi-Fi")) armNetworkTrigger(this);
             }
         }, "health-job").start();
         return true;

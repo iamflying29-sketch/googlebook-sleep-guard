@@ -119,6 +119,9 @@ final class Starter {
         // Stopped by the user: the helper (which notices port changes) is not running, so the routine
         // checks keep the published Wireless debugging address current; nothing is started.
         if (prefs(ctx).getBoolean("stopped", false)) return run(ctx, Action.PUBLISH, true);
+        // A restart (new app version) that could not be carried out earlier (no Wi-Fi for a long time) is
+        // still owed: without this the old helper code would run until the next reboot.
+        if (prefs(ctx).getBoolean("restartPending", false)) return run(ctx, Action.RESTART, true);
         return run(ctx, Action.ENSURE, true);
     }
 
@@ -174,6 +177,7 @@ final class Starter {
             Result r = new Result();
             try {
                 r = runLocked(ctx, action, auto);
+                if (auto && action == Action.RESTART) prefs(ctx).edit().putBoolean("restartPending", !r.ok).commit();
             } catch (Exception e) {
                 r.ok = false;
                 r.summary = "Error: " + e;
@@ -206,8 +210,10 @@ final class Starter {
             return r;
         }
         if (adbWifi(ctx) != 1) {
-            r.quiet = action == Action.PUBLISH;
-            r.summary = "Wireless debugging is off and could not be switched on. It can be switched on in Developer options.";
+            r.quiet = action == Action.PUBLISH || wifiPaused;
+            r.summary = wifiPaused
+                    ? "Wireless debugging was switched off less than 10 minutes ago, so Sleep Guard left it off for now. It switches it back on at the next check."
+                    : "Wireless debugging is off and could not be switched on. It can be switched on in Developer options.";
             return r;
         }
         AdbClient adb = null;
@@ -263,10 +269,19 @@ final class Starter {
                 // A Stop that could not reach the device earlier (no connection then) is carried out now.
                 String st = adb.exec("sh " + DIR + "/start.sh status 0").trim();
                 String stillRunning = "";
-                if (st.startsWith("running")) {
-                    String out = adb.exec("sh " + DIR + "/start.sh stop");
-                    stillRunning = " It was still running and has been stopped now (" + out.trim() + ").";
-                    Log.i(TAG, "stopped the helper that a previous Stop could not reach");
+                if (st.startsWith("running") || st.startsWith("waiting")) {
+                    if (st.contains("stopped by user")) {
+                        // The device still says "stop" and yet something runs: the earlier Stop did not finish.
+                        String out = adb.exec("sh " + DIR + "/start.sh stop");
+                        stillRunning = " It was still running and has been stopped now (" + out.trim() + ").";
+                        Log.i(TAG, "stopped the helper that a previous Stop could not reach");
+                    } else {
+                        // Started on the device itself (sleep-guard start in the Linux terminal): that is the
+                        // user's latest word, so the app follows it instead of stopping the helper again.
+                        prefs(ctx).edit().putBoolean("stopped", false).commit();
+                        stillRunning = " It was started again from the Linux terminal, so Sleep Guard is on.";
+                        Log.i(TAG, "the helper was started on the device: following that");
+                    }
                 }
                 r.ok = publishProblem == null;
                 r.quiet = r.ok;
@@ -303,6 +318,7 @@ final class Starter {
             // Only the status lines above the log count (old log lines may mention a past stand-down).
             String head = r.status.split("--- log ---", 2)[0];
             boolean running = head.startsWith("running");
+            boolean waiting = head.startsWith("waiting"); // the supervisor runs and starts the helper shortly
             boolean standingDown = head.contains("STANDING DOWN:");
             if (action == Action.STOP) {
                 r.ok = !running;
@@ -310,6 +326,10 @@ final class Starter {
             } else if (standingDown) {
                 r.ok = false;
                 r.summary = "Sleep Guard is standing down (the laptop behaves like stock): " + Starter.line(head, "STANDING DOWN");
+            } else if (waiting) {
+                r.ok = true;
+                r.quiet = true;
+                r.summary = "Sleep Guard's supervisor is running and will start the helper again shortly.";
             } else {
                 r.ok = running;
                 r.summary = running ? "Sleep Guard is running." : "Sleep Guard did not start: " + out.trim();
@@ -325,7 +345,11 @@ final class Starter {
     }
 
     /** stopped: the user pressed Stop; only the pairing is protected then, nothing is switched on. */
+    /** Set when the last ensureWirelessDebugging left the switch off on purpose (the 10-minute pause). */
+    private static volatile boolean wifiPaused;
+
     private static void ensureWirelessDebugging(Context ctx, boolean stopped) throws InterruptedException {
+        wifiPaused = false;
         try {
             android.content.ContentResolver cr = ctx.getContentResolver();
             // Android forgets every debugging pairing that has not connected for 7 days unless the
@@ -340,15 +364,16 @@ final class Starter {
             if (prefs(ctx).getBoolean("keepUsbDebugging", false) && Settings.Global.getInt(cr, Settings.Global.ADB_ENABLED, 0) != 1) {
                 Settings.Global.putInt(cr, Settings.Global.ADB_ENABLED, 1);
             }
-            if (adbWifi(ctx) == 1) {
-                prefs(ctx).edit().putBoolean("wifiDropped", false).apply();
-                return;
-            }
             if (!wifiConnected(ctx)) {
-                // GooglebookOS switches Wireless debugging off when Wi-Fi drops (e.g. in deep sleep):
-                // switch it back on as soon as Wi-Fi returns, without the 10-minute pause below.
+                // GooglebookOS switches Wireless debugging off when Wi-Fi drops (e.g. in deep sleep), sometimes
+                // a little later than the drop itself: switch it back on as soon as Wi-Fi returns, without
+                // the 10-minute pause below.
                 prefs(ctx).edit().putBoolean("wifiDropped", true).commit();
                 HealthJob.armNetworkTrigger(ctx);
+                return;
+            }
+            if (adbWifi(ctx) == 1) {
+                prefs(ctx).edit().putBoolean("wifiDropped", false).apply();
                 return;
             }
             boolean dropped = prefs(ctx).getBoolean("wifiDropped", false);
@@ -356,7 +381,7 @@ final class Starter {
             // Sleep Guard needs Wireless debugging to (re)start its helper, so it switches it back on
             // (to keep it off, press Stop: a stopped Sleep Guard leaves it alone). Not more often than
             // every 10 minutes, unless it went off because Wi-Fi dropped.
-            if (!dropped && now - last < 600_000 && now >= last) return;
+            if (!dropped && now - last < 600_000 && now >= last) { wifiPaused = true; return; }
             prefs(ctx).edit().putLong("wifiAssertAt", now).putBoolean("wifiDropped", false).commit();
             Settings.Global.putInt(ctx.getContentResolver(), "adb_wifi_enabled", 1);
             Log.i(TAG, "turned Wireless debugging on");
@@ -429,13 +454,16 @@ final class Starter {
             }
         };
         nsd.discoverServices("_adb-tls-connect._tcp", NsdManager.PROTOCOL_DNS_SD, listener);
-        gotOne.await(timeoutMs, TimeUnit.MILLISECONDS);
-        Thread.sleep(500);
-        try { nsd.stopServiceDiscovery(listener); } catch (RuntimeException ignored) { }
-        synchronized (callbacks) {
-            closed[0] = true;
-            for (NsdManager.ServiceInfoCallback cb : callbacks) {
-                try { nsd.unregisterServiceInfoCallback(cb); } catch (RuntimeException ignored) { }
+        try {
+            gotOne.await(timeoutMs, TimeUnit.MILLISECONDS);
+            Thread.sleep(500);
+        } finally { // an interrupted wait must not leave a discovery session open
+            try { nsd.stopServiceDiscovery(listener); } catch (RuntimeException ignored) { }
+            synchronized (callbacks) {
+                closed[0] = true;
+                for (NsdManager.ServiceInfoCallback cb : callbacks) {
+                    try { nsd.unregisterServiceInfoCallback(cb); } catch (RuntimeException ignored) { }
+                }
             }
         }
         LinkedHashSet<Integer> unique = new LinkedHashSet<>();

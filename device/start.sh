@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Sleep Guard - on-device supervisor (runs as the adb shell user). Installed into
+# Sleep Guard: on-device supervisor (runs as the adb shell user). Installed into
 # /data/local/tmp/sleepguard by the Sleep Guard app (at boot / every health check, through its OWN
 # paired adb key) or by the sleep-guard script in the Linux terminal.
 #   sh start.sh start    start (idempotent); clears a user stop and a stand-down
@@ -59,7 +59,7 @@ locked() {
     (
         n=0
         until flock -n 9; do
-            n=$((n + 1)); [ $n -ge 30 ] && { echo "another start/stop is still in progress"; exit 0; }
+            n=$((n + 1)); [ $n -ge 30 ] && { echo "another start or stop is still in progress"; exit 0; }
             sleep 1
         done
         "$@"
@@ -99,6 +99,7 @@ case "$1" in
     status)
         if supervisor_alive && helper_alive; then echo "running"
         elif supervisor_alive && standing_down; then echo "running (supervisor only)"
+        elif supervisor_alive; then echo "waiting (the supervisor is running and starts the helper shortly)"
         else echo "NOT running"; fi
         standing_down && cat $D/standdown
         [ "$(control)" = stop ] && echo "stopped by user"
@@ -118,7 +119,7 @@ case "$1" in
                 echo "$orphan" > $D/helper.pid
                 slog "watching the helper that is already running (pid $orphan)"
                 while [ -d /proc/$orphan ] && [ "$(control)" != stop ] && [ "$(cat $D/supervisor.pid 2>/dev/null)" = "$$" ]; do
-                    sleep 1
+                    sleep 5   # nothing here is urgent (a stop kills the helper directly)
                 done
                 if [ ! -d /proc/$orphan ]; then
                     slog "the watched helper (pid $orphan) exited"

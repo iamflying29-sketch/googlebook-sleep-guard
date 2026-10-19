@@ -321,7 +321,7 @@ Sleep Guard leaves Wireless debugging alone.
 | `sleep-guard pair [CODE IP:PAIRPORT [IP:PORT]]` | Pairs Sleep Guard's own adb key, and connects if you give the connection address. |
 | `sleep-guard connect [IP:PORT]` | Connects to Wireless debugging. Without an address it uses the address the app published. |
 | `sleep-guard install-app [--force]` | Builds, installs or updates the app, grants its permissions, gives it the key and restarts the helper. `--force` skips the check that the app on the device is the one holding your key. |
-| `sleep-guard status [N]` | Shows whether Sleep Guard is running, any stand-down, the build and whether it is verified, and the last N log lines (12 by default). This is also what `sleep-guard` with no command does. |
+| `sleep-guard status [N]` | Shows whether Sleep Guard is running ("waiting" means the supervisor is running and starts the helper shortly), any stand-down, the build and whether it is verified, and the last N log lines (12 by default). This is also what `sleep-guard` with no command does. |
 | `sleep-guard log [N]` | Shows the last N lines of the helper's log (60 by default). |
 | `sleep-guard check` | Runs the helper's self-test once and prints the lid device, the lid state GooglebookOS sees, the charger, the Wireless debugging port, the screen state, the key and button devices and the build. |
 | `sleep-guard start` | Turns Sleep Guard on. It also retries right away after a stand-down. |

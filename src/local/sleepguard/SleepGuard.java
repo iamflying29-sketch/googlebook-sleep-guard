@@ -172,6 +172,8 @@ public final class SleepGuard {
         } catch (Exception e) {
             if (p != null) p.destroyForcibly();
             return "";
+        } finally {
+            if (p != null) { try { p.getInputStream().close(); } catch (IOException ignored) { } }
         }
     }
 
@@ -258,6 +260,7 @@ public final class SleepGuard {
     volatile IBinder settleLock, wakeLock;    // changed only under grabLock
     volatile int settleLevel;                 // the settle lock's level (sleep lock with the lid closed)
     volatile long sleepLockReleasedAt;        // uptime of the last sleep lock release (a late user action still gets a wake)
+    volatile boolean docked;                  // GooglebookOS's base state is DOCKED (lid closed, external display)
     volatile long lockSince = 0;         // uptime when the current lid-closed lock was taken (live check)
     volatile long settleUntil = 0;
     volatile boolean lidClosed;
@@ -577,7 +580,7 @@ public final class SleepGuard {
             // was released within the last second: the user's action may have come while it was still
             // held and been refused, and this reader thread simply ran late (a slow disk sync, a busy
             // resume). Then make sure the laptop wakes anyway; ensureAwake does nothing if it is awake.
-            if (!onlyWhenAsleep && SystemClock.uptimeMillis() - sleepLockReleasedAt < 1000)
+            if (reason == WAKE_REASON_LID && SystemClock.uptimeMillis() - sleepLockReleasedAt < 1000)
                 background("user-wake", () -> ensureAwake(what, reason));
             return;
         }
@@ -607,6 +610,7 @@ public final class SleepGuard {
             if (!onlyWhenAsleep) background("user-wake", () -> ensureAwake(what, reason));
             if (w == null && st == null) return; // another thread was first; nothing to log
             now = SystemClock.uptimeMillis();
+            if (onlyWhenAsleep && st != null && lidClosed && now < settleUntil) background("settle-resume", () -> resumeSettle(what));
             if (st != null && !lidClosed && now < settleUntil) {
                 settleLevel = PARTIAL_WAKE_LOCK;
                 settleLock = acquireLock("SleepGuard:settle", PARTIAL_WAKE_LOCK);
@@ -616,6 +620,27 @@ public final class SleepGuard {
         if (w != null) log("hold over: " + what, false);
         if (st != null) log("settle lock released: " + what, false);
         if (goesOn) log("the settle goes on with an ordinary wakelock for " + ((settleUntil - now) / 1000) + " s", false);
+    }
+
+    /**
+     * A lid-closed settle was released for a key or mouse event. If GooglebookOS did not wake the laptop
+     * on it (with the lid closed it does not), the charger still needs its settle: take the sleep lock
+     * again for the rest of it one second later, while the laptop is still asleep.
+     */
+    void resumeSettle(String what) {
+        SystemClock.sleep(1000);
+        if (exiting || interactive()) return; // awake: in use, nothing to protect
+        boolean resumed = false;
+        long left;
+        synchronized (grabLock) {
+            left = settleUntil - SystemClock.uptimeMillis();
+            if (lidClosed && settleLock == null && wakeLock == null && left > 500) {
+                settleLevel = PARTIAL_SLEEP_WAKE_LOCK;
+                settleLock = acquireLock("SleepGuard:settle", PARTIAL_SLEEP_WAKE_LOCK);
+                if (settleLock != null) { lockSince = SystemClock.uptimeMillis(); resumed = true; }
+            }
+        }
+        if (resumed) log("the settle goes on with the sleep lock for " + (left / 1000) + " s (GooglebookOS did not wake on " + what + ")", true);
     }
 
     /**
@@ -636,7 +661,7 @@ public final class SleepGuard {
     void ensureAwake(String what, int reason) {
         for (int i = 0; i < 3; i++) {
             if (interactive()) {
-                log(i == 0 ? what + " while Sleep Guard held its lock: the laptop woke by itself"
+                log(i == 0 ? what + " while Sleep Guard held or had just released its lock: the laptop woke by itself"
                         : "woke the laptop after " + what + " (GooglebookOS's own wake-up had been refused while Sleep Guard held its sleep lock)", true);
                 return;
             }
@@ -831,8 +856,10 @@ public final class SleepGuard {
                     ByteBuffer bb = ByteBuffer.wrap(ev).order(ByteOrder.LITTLE_ENDIAN);
                     int type = bb.getShort(16) & 0xffff, code = bb.getShort(18) & 0xffff, value = bb.getInt(20);
                     if (type == 1 /* EV_KEY */ && value == 1) {
-                        if (code == KEY_POWER) userWoke("the power button was pressed", WAKE_REASON_POWER_BUTTON, true);
-                        else userWoke("a key was pressed (" + name + ")", WAKE_REASON_WAKE_KEY, true);
+                        // Docked (lid closed, external display): GooglebookOS wakes on keys, so repeat a refused
+                        // wake there too. With the lid simply closed it does not wake on keys, and neither do we.
+                        if (code == KEY_POWER) userWoke("the power button was pressed", WAKE_REASON_POWER_BUTTON, !docked);
+                        else userWoke("a key was pressed (" + name + ")", WAKE_REASON_WAKE_KEY, !docked);
                     } else if (type == 2 /* EV_REL: a mouse moved */) {
                         long t = SystemClock.uptimeMillis();
                         if (t - lastMotion >= 200) {
@@ -890,6 +917,7 @@ public final class SleepGuard {
                     return;
                 }
                 SystemClock.sleep(2000);
+                lidResync = true; // again: the lid may have moved during these 2 s, with nobody listening
                 String again = findLidDevice(); // the device may have been re-created under another name
                 if (again != null && !UNKNOWN.equals(again) && !again.equals(dev)) {
                     log("lid switch device moved to " + again, true);
@@ -957,6 +985,7 @@ public final class SleepGuard {
         // the sleep lock is held releases it and wakes the laptop.
         watchKeyDevices(true);
         if (lidChangedAt == 0) lidClosed = base == STATE_CLOSED || base == dockedId;
+        docked = dockedId != -1 && base == dockedId;
         lidResync = true; // the first pass re-reads it: the lid may have moved before the reader was listening
         Boolean c = chargerConnected();
         if (c == null) retryLater("the battery report is unavailable right now");
@@ -1001,7 +1030,8 @@ public final class SleepGuard {
         boolean prevCharger = charger;
         boolean prevLid = lidClosed;
         boolean screenOn = interactive();
-        long lastPollAt = SystemClock.uptimeMillis(), chargerUnknownSince = 0;
+        long lastPollAt = SystemClock.uptimeMillis(), chargerUnknownSince = 0, lastLidBackstop = lastPollAt;
+        boolean prevScreenOn = screenOn;
         long windowCheckAt = 0;     // live check pending in the current lid-closed window
         int checkTries = 0;
         boolean checkFailedOnce = false;
@@ -1054,6 +1084,7 @@ public final class SleepGuard {
                 } else if (now - chargerUnknownSince > 60_000) {
                     retryLater("the battery report has been unavailable for a minute");
                 }
+                prevScreenOn = screenOn;
                 screenOn = interactive();
                 screenOnShared = screenOn;
                 now = SystemClock.uptimeMillis();
@@ -1064,16 +1095,25 @@ public final class SleepGuard {
                 if (!servicesAlive()) retryLater("GooglebookOS's system services restarted");
                 standDown(lockFailure, this);
             }
+            // A backstop once a minute while the lid reads closed and nothing is held: a lid state stuck at
+            // "closed" with the lid really open would bring back wake holds that refuse the user's wake-ups.
+            if (lidClosed && wakeLock == null && settleLock == null && now - lastLidBackstop >= 60_000) {
+                lastLidBackstop = now;
+                lidResync = true;
+            }
             if (lidResync) {
                 // Events may have been lost: GooglebookOS's own lid state is the truth.
                 lidResync = false;
+                long before = lidChangedAt;
                 int b = baseState();
-                if (b != -1) {
+                if (b != -1 && lidChangedAt == before) { // a real lid event during the report wins
                     boolean closed = b == STATE_CLOSED || b == dockedId;
+                    docked = dockedId != -1 && b == dockedId;
                     if (closed != lidClosed) {
                         lidChangedAt = SystemClock.uptimeMillis();
                         lidClosed = closed;
                         log("lid state re-read: " + (closed ? "closed" : "open"), true);
+                        if (!closed) fixSettleLidOpen();
                     }
                 }
             }
@@ -1085,14 +1125,17 @@ public final class SleepGuard {
                         + (SETTLE_BUDGET_WINDOW_MS / 60_000) + " minutes): no keep-awake settles until it is steady again", true);
                 flapLogged = true;
                 prevCharger = charger;
-            } else if (charger != prevCharger && screenOn && (screenOn = interactive())) {
-                // The laptop is in use (screen on, lid open or docked): it cannot fall asleep, so there is
-                // nothing to protect and Sleep Guard stays out of the way entirely (no lock, nothing held).
-                // Asked again live: the poll runs only every 2 s while the screen is on.
+            } else if (charger != prevCharger && screenOn && prevScreenOn && (screenOn = interactive())) {
+                // The laptop is in use (screen on since before this change, lid open or docked): it cannot fall
+                // asleep, so there is nothing to protect and Sleep Guard stays out of the way entirely (no lock,
+                // nothing held). Asked again live: the poll runs only every 2 s while the screen is on. A screen
+                // that just turned on (the plug itself may have lit it) does not count as in use: the display
+                // can time out within the 20 s, so that change gets its settle (the ordinary lock, lid open).
                 flapLogged = false;
                 log("charger " + (charger ? "CONNECTED" : "DISCONNECTED") + " (screen on, the laptop is in use): nothing to do", true);
                 prevCharger = charger;
             } else if (charger != prevCharger) {
+                screenOnShared = screenOn;
                 flapLogged = false;
                 // The lock first, logs after.
                 extendProtection(now + SETTLE_MS);
@@ -1127,12 +1170,12 @@ public final class SleepGuard {
                 // The lid closed during a settle: GooglebookOS now force-disables ordinary wakelocks, so the
                 // rest of the settle needs the sleep lock (the lid is closed: it cannot block the user).
                 synchronized (grabLock) {
-                    if (settleLock != null && settleLevel == PARTIAL_WAKE_LOCK) {
+                    if (settleLock != null && settleLevel == PARTIAL_WAKE_LOCK && lidClosed) { // the lid read live
                         IBinder old = settleLock;
                         IBinder b = acquireLock("SleepGuard:settle", PARTIAL_SLEEP_WAKE_LOCK);
                         if (b != null) {
-                            settleLock = b;
                             settleLevel = PARTIAL_SLEEP_WAKE_LOCK;
+                            settleLock = b;
                             lockSince = SystemClock.uptimeMillis();
                             releaseLock(old);
                             windowCheckAt = 0; // a fresh lid-closed lock: live check it
@@ -1186,7 +1229,12 @@ public final class SleepGuard {
                     windowCheckAt = now + 400;
                     extendProtection(now + 600);
                 } else if (p != null) {
-                    standDown(p + " with the lid closed (the protection can't work)", this);
+                    boolean stillHeld;
+                    synchronized (grabLock) { // a user action may have released the lock during the report
+                        stillHeld = lidClosed && (wakeLock != null || (settleLock != null && settleLevel == PARTIAL_SLEEP_WAKE_LOCK));
+                    }
+                    if (!stillHeld) windowCheckAt = -1;
+                    else standDown(p + " with the lid closed (the protection can't work)", this);
                 } else {
                     windowCheckAt = -1; // done for this window
                     boolean stillSleepLock;
@@ -1325,7 +1373,7 @@ public final class SleepGuard {
                     + " base state=" + g.baseState() + " charger=" + g.chargerConnected()
                     + " wireless debugging port=" + g.adbWifiPort()
                     + " screen=" + (g.interactive() ? "on" : "off") + " key devices=" + keyDevices()
-                    + " keep-awake=sleep lock (lid closed) / ordinary wakelock (lid open), wake safety net build=" + fingerprint()
+                    + " keep-awake=sleep lock with the lid closed or the ordinary wakelock with the lid open, wake safety net build=" + fingerprint()
                     + (fingerprint().equals(readFile(VERIFIED)) ? " (verified)" : " (not yet verified)"));
             return;
         }

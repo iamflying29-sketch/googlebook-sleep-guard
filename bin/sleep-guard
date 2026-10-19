@@ -71,6 +71,12 @@ keep_pairing() {
 need_device() {
     DEV=$(connected || true)
     local pub="" res="" age=""
+    # A listed device may be a stale entry from before Wireless debugging moved to a new port (adb notices
+    # a dead connection late): one short probe, and on failure the published address is used instead.
+    if [ -n "$DEV" ] && ! HOME=$H timeout 10 adb -s "$DEV" shell true </dev/null >/dev/null 2>&1; then
+        sgadb disconnect "$DEV" >/dev/null 2>&1 || true
+        DEV=""
+    fi
     if [ -z "$DEV" ]; then
         pub=$(published)
         if [ -n "$pub" ]; then

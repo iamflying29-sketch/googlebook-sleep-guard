@@ -71,6 +71,16 @@ asleep included. Taking it needs the `ACQUIRE_SLEEP_LOCK` permission, which is a
 user holds. So the helper, which runs as that user, can hold the laptop awake with this one lock, without changing
 anything else.
 
+The sleep lock has one catch, and I learned it the hard way on October 19, 2026: while it is held, the power manager
+refuses every wake request, including the keyboard, the power button and even the lid switch
+(`PowerManagerService.hasWakeLockKeepingGroupAsleep`). My laptop had fallen asleep with the lid open, the charger
+state changed, and for the whole 20-second settle nothing could wake it; the system log recorded 135 refused wake
+attempts in 43 seconds. So Sleep Guard now uses the sleep lock only with the lid closed, where GooglebookOS leaves
+no other choice, and uses an ordinary `PARTIAL_WAKE_LOCK` whenever the lid is open (GooglebookOS disables that level
+only in the lid-closed state, and the power manager never refuses a wake for it). And whenever the sleep lock is
+held, opening the lid or pressing the power button releases it at once; if GooglebookOS's own wake request had been
+refused in the meantime (it is not repeated), the helper wakes the laptop itself.
+
 An earlier version of Sleep Guard did not know about that lock. It made GooglebookOS see the lid as open for a
 moment at every wake (a device state override), so that ordinary wakelocks would work. That worked, but it made
 GooglebookOS run its whole "lid opened" routine each time: the audio was unmuted and muted again, the keyboard and
@@ -86,19 +96,27 @@ removes all of that. Sleep Guard now never touches the lid state.
    this safe: the laptop cannot fall back asleep until it is released. During the hold the helper reads the charger
    state from the battery service every 25 milliseconds. Holds are never skipped, but once they add up to 15 seconds
    within 15 minutes, each new hold is shortened to 0.15 seconds.
-3. **The settle.** When the charger state changes while the laptop could be asleep (the lid closed, or the screen
-   off), the helper takes the sleep lock for the settle (`SleepGuard:settle`) for 20 seconds, so the USB-C
-   controller can finish before the laptop is allowed back into deep sleep. While the laptop is in use, with the lid
-   open and the screen on, it cannot fall asleep, so Sleep Guard does nothing at all at a charger change: it only
-   writes a line to its log, and it reads the battery report just once every 2 seconds. A charger that keeps connecting and disconnecting (a loose plug or a failing cable) does not keep the
-   laptop awake without end: after 20 changes within 15 minutes the settles pause until it is steady again.
+3. **The settle.** When the charger state changes while the laptop could be asleep (the screen off), the helper
+   keeps the laptop awake for 20 seconds (`SleepGuard:settle`), so the USB-C controller can finish before the laptop
+   is allowed back into deep sleep. With the lid closed this is the sleep lock; with the lid open it is an ordinary
+   wakelock, which never gets in the way of waking the laptop. If the lid closes during such a settle, the sleep lock
+   takes over for the rest of it. Whenever the screen is on, the laptop is in use and cannot fall asleep, so Sleep
+   Guard does nothing at all at a charger change: it only writes a line to its log, and it reads the battery report
+   just once every 2 seconds. A charger that keeps connecting and disconnecting (a loose plug or a failing cable) does
+   not keep the laptop awake without end: after 20 changes within 15 minutes the settles pause until it is steady
+   again.
 4. **Handing back to stock.** When the window ends, the helper releases the lock and GooglebookOS puts the laptop
    back into deep sleep exactly as it would have anyway. Nothing else was changed, so nothing has to be undone.
-5. **Opening the lid.** The helper reads the lid switch input device directly, so it always knows whether the lid is
-   closed. When the lid opens, any wake hold is released at once; a running settle simply finishes.
+5. **Opening the lid, pressing the power button.** The helper reads the lid switch and the power button input
+   devices directly, so it always knows when you want the laptop awake. When the lid opens or the power button is
+   pressed while the sleep lock is held, the lock is released at once, and the helper then checks that the screen is
+   coming on; if GooglebookOS's own wake request was refused during the hold, the helper asks the power manager to
+   wake the laptop (the adb shell user holds the `DEVICE_POWER` permission this needs). A settle that was running
+   goes on with an ordinary wakelock.
 
-The screen never comes on during a hold or a settle, because the sleep lock is a processor lock only. It does not
-touch the display, the lid state or anything the lid-opened routine reacts to.
+The screen never comes on during a hold or a settle, because both locks are processor locks only. They do not touch
+the display, the lid state or anything the lid-opened routine reacts to. The only time the helper ever asks for the
+screen is right after you opened the lid or pressed the power button while a sleep lock was held.
 
 ### Results
 
@@ -109,6 +127,12 @@ the wake and a plug-in 140 milliseconds after the wake, each followed by the 20-
 deep sleep. The plug-in test also showed why the settle matters: the USB-C connection reported connected and
 disconnected five times within 1.5 seconds while it negotiated, and the laptop stayed awake through all of it. During
 both tests the system log showed no lid-opened routine at all between the real lid close and the real lid open.
+
+On October 19, 2026 the lid-open case failed in the way described above: the laptop, asleep with the lid open, could
+not be woken for the length of a settle. The fix (ordinary wakelock with the lid open, the sleep lock only with the
+lid closed, and the release-and-wake safety net) passed its bounded tests on the laptop the same night: both locks
+are accepted and listed as active, the wake-up call is accepted, and the power service answers normally afterwards.
+The live test of opening the lid during a lid-closed settle is the next thing I am proving.
 
 ### Safety and self-checks
 
@@ -126,9 +150,12 @@ helper is now built so that it can never block a system service:
 - Only one helper can run at a time (a lock file), and the supervisor runs only one start or stop at a time (`flock`).
 - The locks belong to the helper's process, so GooglebookOS drops them if the helper dies. There is nothing else to
   undo, because the helper never changes the lid state or any setting.
+- The helper must never stop you from waking the laptop. The sleep lock, which makes the power manager refuse wake
+  requests, is held only with the lid closed and only briefly, and a lid opening or a power button press releases it
+  at once and wakes the laptop if needed. With the lid open the helper uses only an ordinary wakelock.
 - At every start the helper runs a **self-test** of everything it relies on: the `CLOSED` and `OPEN` states, the lid
-  switch input device, the format of the battery and device state reports, and the sleep lock itself (taken and
-  released once). If something has changed, it **stands down**: it releases everything, records the reason for this
+  switch input device, the format of the battery and device state reports, and both locks (each taken and released
+  once). If something has changed, it **stands down**: it releases everything, records the reason for this
   GooglebookOS build, and posts a notification. The laptop then behaves exactly like stock. Something that is only
   unavailable for the moment, for example right after boot, makes it retry later instead.
 - On a GooglebookOS build it has not seen before, it **verifies itself live** during the first lid-closed wake hold:
@@ -283,7 +310,7 @@ Sleep Guard leaves Wireless debugging alone.
 | `sleep-guard install-app [--force]` | Builds, installs or updates the app, grants its permissions, gives it the key and restarts the helper. `--force` skips the check that the app on the device is the one holding your key. |
 | `sleep-guard status [N]` | Shows whether Sleep Guard is running, any stand-down, the build and whether it is verified, and the last N log lines (12 by default). This is also what `sleep-guard` with no command does. |
 | `sleep-guard log [N]` | Shows the last N lines of the helper's log (60 by default). |
-| `sleep-guard check` | Runs the helper's self-test once and prints the lid device, the lid state GooglebookOS sees, the charger, the Wireless debugging port, the screen state and the build. |
+| `sleep-guard check` | Runs the helper's self-test once and prints the lid device, the lid state GooglebookOS sees, the charger, the Wireless debugging port, the screen state, the power button devices and the build. |
 | `sleep-guard start` | Turns Sleep Guard on. It also retries right away after a stand-down. |
 | `sleep-guard stop` | Stops Sleep Guard until the next `start`, also across reboots. |
 | `sleep-guard usb-debugging on` or `off` | Allows the app to keep USB debugging switched on, which keeps the helper alive if Wireless debugging drops. It is off by default. |
@@ -312,11 +339,15 @@ Some typical lines:
 | --- | --- |
 | `start: build verified, lid=closed, ...` | The helper started and passed its self-test. |
 | `holding the laptop awake 300 ms (sleep lock): woke from deep sleep with the lid closed` | A wake hold started. |
-| `charger DISCONNECTED (lid closed, screen off): keeping the laptop awake 20 s` | A charger change was caught and the settle started. |
+| `charger DISCONNECTED (lid closed, screen off): keeping the laptop awake 20 s (sleep lock)` | A charger change was caught and the settle started. With the lid open the line ends in `(ordinary wakelock)`. |
+| `charger CONNECTED (screen on, the laptop is in use): nothing to do` | A charger change while you were using the laptop; nothing was held. |
 | `hold over: normal lid-closed sleep` | The wake hold ended and the laptop went back to stock deep sleep. |
 | `settle done, wakelock released` | The 20-second settle ended. |
 | `live check OK: lid closed, GooglebookOS keeps the laptop awake for Sleep Guard's lock` | The live check passed. |
 | `lid opened (4 wake holds while it was closed)` | The lid was opened; the count shows how often the laptop woke while it was closed. |
+| `the lid opened while Sleep Guard held its lock: the laptop woke by itself` | The lid opened during a hold or a settle; the sleep lock was released at once and GooglebookOS's own wake went through. |
+| `woke the laptop after the lid opened (GooglebookOS's own wake-up had been refused while Sleep Guard held its sleep lock)` | The safety net had to wake the laptop itself. The same lines exist for `the power button was pressed`. |
+| `the settle goes on with an ordinary wakelock for 12 s` | The lid opened during a lid-closed settle; the rest of it runs with the ordinary wakelock. |
 | `asked the Sleep Guard app to publish the new address (...)` | Wireless debugging moved to a new port. |
 | `STANDING DOWN: ...` | Sleep Guard switched itself off safely, with the reason. |
 | `supervisor: helper exited (N)` | The helper exited with code N and the supervisor restarts it. |
@@ -337,7 +368,8 @@ adb shell 'CLASSPATH=$(pm path --user current local.sleepguard | head -1 | cut -
 | --- | --- |
 | `check` | The self-test and current readings (the same as `sleep-guard check`). |
 | `dumptest` | Reads the power service's report 20 times, then stops reading early on purpose (after 1 KB and after 1 millisecond) and confirms that the power service still answers normally. |
-| `locktest` | Takes the sleep lock, confirms that the power service lists it as active and holds its kernel suspend blocker, releases it and confirms that it is gone. |
+| `locktest` | Takes the ordinary wakelock and then the sleep lock, confirms that the power service lists each as active and holds its kernel suspend blocker for the sleep lock, releases them and confirms that they are gone. |
+| `waketest` | Makes the wake-up call the safety net relies on (a no-op while the screen is on) and reports whether GooglebookOS accepted it. |
 | `repair` | Does nothing in this version and says so. Earlier versions changed the lid state and had to undo it after every helper exit; the current supervisor no longer runs it. |
 
 ## Updating, and what happens after app or GooglebookOS updates
@@ -465,8 +497,9 @@ Two start or stop requests overlapped. Wait half a minute and try again.
 - **It never deletes files.** The supervisor and the helper keep their state by overwriting small files in
   `/data/local/tmp/sleepguard`. The logs are kept small by renaming a log over 2 MB to a `.1` file, which replaces
   the previous `.1` file.
-- **It never injects input, and it never changes the lid state or the screen.** The sleep lock keeps the processor
-  awake and nothing else.
+- **It never injects input, and it never changes the lid state.** Both locks keep the processor awake and nothing
+  else. The one thing it ever asks of the screen is a wake-up, and only right after you opened the lid or pressed the
+  power button while the sleep lock was held and GooglebookOS's own wake had been refused.
 - **Its own key and its own adb server.** Sleep Guard uses its own paired adb key and its own adb server port (5039),
   separate from your normal adb connection and from every other project. The keys stay in `~/.config/sleep-guard`
   and in the app's private storage, and they are never part of this repository.
@@ -503,6 +536,12 @@ Two start or stop requests overlapped. Wait half a minute and try again.
   small but not zero.
 - **During a lid-closed settle the laptop is awake for 20 seconds.** The screen stays off and nothing else changes,
   but the glow bar may light up during those seconds, because the EC lights it while the laptop is awake.
+- **Waking from an external keyboard or mouse during a lid-closed settle.** With the lid closed, the sleep lock is
+  the only lock GooglebookOS honours, and while it is held the power manager refuses wake requests. The helper
+  watches the lid switch and the power buttons and wakes the laptop for you, but it does not watch external input
+  devices. If you use the laptop docked with the lid closed and an external screen that has gone dark, a key or
+  mouse wake during the 20 seconds after a charger change may be ignored; press the power button or try again after
+  the settle. Wake holds last 0.3 seconds, so they are not noticeable.
 - **It needs Wireless debugging to start.** After a reboot, the helper starts only once the Googlebook is on Wi-Fi
   and Wireless debugging is on.
 - **The Android user is detected automatically.** The helper asks GooglebookOS for the current user when it sends a

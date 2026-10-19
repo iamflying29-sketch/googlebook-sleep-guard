@@ -132,7 +132,12 @@ On October 19, 2026 the lid-open case failed in the way described above: the lap
 not be woken for the length of a settle. The fix (ordinary wakelock with the lid open, the sleep lock only with the
 lid closed, and the release-and-wake safety net) passed its bounded tests on the laptop the same night: both locks
 are accepted and listed as active, the wake-up call is accepted, and the power service answers normally afterwards.
-The live test of opening the lid during a lid-closed settle is the next thing I am proving.
+I then proved the safety net live at 12:37 AM: with the lid closed I unplugged the charger (a wake hold and then a
+settle with the sleep lock) and opened the lid four seconds later. The system log shows GooglebookOS's own lid wake
+being refused twice ("Preventing waking device, due to wakelocks: 0x201"), the helper releasing its locks within
+5 milliseconds of the lid switch, and the helper's own wake-up going through 25 milliseconds later
+("Waking up from Asleep (uid=2000, reason=WAKE_REASON_LID, details=SleepGuard:the lid opened)"). The screen came on
+at once, and the rest of the settle ran with the ordinary wakelock.
 
 ### Safety and self-checks
 

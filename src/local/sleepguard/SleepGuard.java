@@ -562,9 +562,9 @@ public final class SleepGuard {
     }
 
     /**
-     * The user acted (opened the lid, pressed the power button) while the sleep lock may be held:
-     * release it at once (while it is held GooglebookOS refuses every wake request, this one
-     * included) and make sure the laptop wakes. From the input reader threads. A settle that was
+     * The user acted (opened the lid, pressed a key or a button, moved a mouse) while the sleep lock may
+     * be held: release it at once (while it is held GooglebookOS refuses every wake request, this one
+     * included), and after a lid opening also make sure the laptop wakes. From the input reader threads. A settle that was
      * running with the lid open continues with the ordinary wakelock (it never blocks a wake-up).
      */
     void userWoke(String what, int reason, boolean onlyWhenAsleep) {
@@ -577,7 +577,7 @@ public final class SleepGuard {
             // was released within the last second: the user's action may have come while it was still
             // held and been refused, and this reader thread simply ran late (a slow disk sync, a busy
             // resume). Then make sure the laptop wakes anyway; ensureAwake does nothing if it is awake.
-            if (reason != WAKE_REASON_WAKE_KEY && SystemClock.uptimeMillis() - sleepLockReleasedAt < 1000)
+            if (!onlyWhenAsleep && SystemClock.uptimeMillis() - sleepLockReleasedAt < 1000)
                 background("user-wake", () -> ensureAwake(what, reason));
             return;
         }
@@ -599,9 +599,12 @@ public final class SleepGuard {
             if (w != null || st != null) sleepLockReleasedAt = SystemClock.uptimeMillis();
             // The wake-up first, the log lines (with their disk syncs) after. Also when another thread
             // released the lock a moment ago: the user's wake request may still have been refused.
-            // Mouse motion only releases: GooglebookOS decides itself whether motion wakes a closed laptop
-            // (the next motion event, 200 ms later, reaches it with the lock gone).
-            if (reason != WAKE_REASON_WAKE_KEY || !what.startsWith("the mouse")) background("user-wake", () -> ensureAwake(what, reason));
+            // Only for the lid: GooglebookOS always wakes on a lid opening, so repeating that request is
+            // exactly its own behaviour. Keys, buttons and mouse motion only release the lock: whether they
+            // wake a closed laptop is GooglebookOS's decision (tested 2026-10-19 02:02: it does not wake on
+            // the power button with the lid closed, and Sleep Guard's own wake-up lit the closed screen).
+            // The next press or movement reaches GooglebookOS with the lock gone.
+            if (!onlyWhenAsleep) background("user-wake", () -> ensureAwake(what, reason));
             if (w == null && st == null) return; // another thread was first; nothing to log
             now = SystemClock.uptimeMillis();
             if (st != null && !lidClosed && now < settleUntil) {

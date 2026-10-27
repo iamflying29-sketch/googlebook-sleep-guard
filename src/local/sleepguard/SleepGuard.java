@@ -101,10 +101,6 @@ public final class SleepGuard {
     static final String LOG = DIR + "/sleepguard.log";
     static final String STANDDOWN = DIR + "/standdown"; // "none" or "STANDING DOWN: <reason> | build=<fp>"
     static final String VERIFIED = DIR + "/verified";   // last build fingerprint verified live
-    /** The user's Glowbar value while Sleep Guard keeps the lid dark during sleep ("" = nothing to restore). */
-    static final String GLOW_SAVED = DIR + "/glowbar.saved";
-    /** GooglebookOS's "Show Glowbar" switch (secure setting; the light bar service tells the EC on every change). */
-    static final String GLOW_KEY = "light_animation_idle_light_enabled";
     static final int EXIT_WATCHDOG = 4, EXIT_STANDDOWN = 5, EXIT_RETRY = 6, EXIT_OTHER_RUNNING = 7;
 
     /** Something is only temporarily unavailable: the supervisor starts the helper again later. */
@@ -228,7 +224,6 @@ public final class SleepGuard {
         exiting = true;
         log("STANDING DOWN: " + reason, true);
         if (g != null) g.releaseAll("standing down");
-        glowbarForLid(false); // nothing of the user's stays changed after a stand-down
         writeFile(STANDDOWN, "STANDING DOWN: " + reason + " | build=" + fingerprint() + "\n");
         if (g != null) g.heartbeat = SystemClock.uptimeMillis(); // the notification wait isn't a stall
         Thread a = alert("Sleep Guard stood down",
@@ -763,50 +758,6 @@ public final class SleepGuard {
         return SystemClock.elapsedRealtime() - SystemClock.uptimeMillis(); // grows by the time spent in deep sleep
     }
 
-    // ---------------------------------------------------------------- glow bar
-    /**
-     * The lid glow bar ("Show Glowbar" in Settings) is the user's: on while the laptop is in use. During
-     * lid-closed sleep the EC lights it at every wake, so Sleep Guard turns the switch off when the lid
-     * closes and puts the user's value back when the lid opens (2026-10-26, the user's wish). Only the
-     * value the user had is ever written back; a Glowbar the user keeps off is never touched.
-     */
-    static String currentUser() {
-        String user = exec("am", "get-current-user").trim();
-        return user.matches("\\d+") ? user : "10";
-    }
-
-    static synchronized void glowbarForLid(boolean closed) {
-        try {
-            String saved = readFile(GLOW_SAVED);
-            if (closed) {
-                if (!saved.isEmpty()) return; // already dark for this sleep
-                String user = currentUser();
-                String value = exec("settings", "get", "--user", user, "secure", GLOW_KEY).trim();
-                if (value.isEmpty()) { log("Glowbar: the setting could not be read, leaving it alone", true); return; }
-                if (value.equals("0")) return; // off by the user's choice: nothing to do, nothing to restore
-                writeFile(GLOW_SAVED, value);
-                exec("settings", "put", "--user", user, "secure", GLOW_KEY, "0");
-                String now = exec("settings", "get", "--user", user, "secure", GLOW_KEY).trim();
-                log("lid closed: Glowbar kept dark for the sleep (your setting was " + value + ", put back when the lid opens)"
-                        + (now.equals("0") ? "" : " BUT THE WRITE DID NOT TAKE (reads " + now + ")"), true);
-            } else {
-                if (saved.isEmpty()) return;
-                String user = currentUser();
-                String back = saved.equals("null") ? "1" : saved; // unset meant the default, on
-                exec("settings", "put", "--user", user, "secure", GLOW_KEY, back);
-                String now = exec("settings", "get", "--user", user, "secure", GLOW_KEY).trim();
-                if (now.equals(back)) {
-                    writeFile(GLOW_SAVED, "");
-                    log("lid opened: Glowbar back on (your setting " + saved + ")", true);
-                } else {
-                    log("lid opened: Glowbar could not be put back (reads " + now + "); trying again at the next lid event", true);
-                }
-            }
-        } catch (RuntimeException e) {
-            log("Glowbar: " + e, true);
-        }
-    }
-
     // ---------------------------------------------------------------- lid
     /**
      * The shell can't read input device names from sysfs/procfs, but getevent can (via ioctl).
@@ -960,11 +911,9 @@ public final class SleepGuard {
                         if (lidClosed) {
                             holdsThisClose.set(0);
                             log("lid closed", true);
-                            background("glowbar", () -> glowbarForLid(true));
                         } else {
                             userWoke("the lid opened", WAKE_REASON_LID, false); // before the log and its disk sync
                             log("lid opened (" + holdsThisClose.get() + " wake holds while it was closed)", true);
-                            background("glowbar", () -> glowbarForLid(false));
                         }
                         synchronized (wake) { wake.notifyAll(); }
                     }
@@ -1048,7 +997,6 @@ public final class SleepGuard {
         if (lidChangedAt == 0) lidClosed = base == STATE_CLOSED || base == dockedId;
         docked = dockedId != -1 && base == dockedId;
         lidResync = true; // the first pass re-reads it: the lid may have moved before the reader was listening
-        background("glowbar", () -> glowbarForLid(lidClosed)); // a previous helper's dark lid is put back if the lid is open
         Boolean c = chargerConnected();
         if (c == null) retryLater("the battery report is unavailable right now");
         boolean charger = c;
@@ -1082,9 +1030,6 @@ public final class SleepGuard {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             exiting = true;
             if (servicesAlive()) releaseAll("exit"); // dead services: the system drops everything anyway
-            // Stopped or restarted with the lid open: the user's Glowbar goes back at once (with the lid
-            // closed it stays dark; the next helper puts it back when the lid opens).
-            if (!lidClosed) glowbarForLid(false);
         }));
         started = true;
         startupDone = true;
@@ -1179,7 +1124,6 @@ public final class SleepGuard {
                         lidClosed = closed;
                         log("lid state re-read: " + (closed ? "closed" : "open"), true);
                         if (!closed) fixSettleLidOpen();
-                        background("glowbar", () -> glowbarForLid(closed));
                     }
                 }
             }
@@ -1412,18 +1356,6 @@ public final class SleepGuard {
             m = java.util.regex.Pattern.compile("PowerManagerService\\.WakeLocks: ref count=(\\d+)").matcher(d);
             System.out.println("after release: " + (i < 0 || j < 0 ? "unknown" : d.substring(i, j).contains("SleepGuard:") ? "STILL HELD" : "not held")
                     + ", kernel suspend blocker ref count=" + (m.find() ? m.group(1) : "?"));
-            return;
-        }
-        if (args.length > 0 && args[0].equals("glowtest")) {
-            // The Glowbar switch, as at a lid close and a lid open: dark, then the user's value back.
-            String user = currentUser();
-            String before = exec("settings", "get", "--user", user, "secure", GLOW_KEY).trim();
-            System.out.println("before: " + before);
-            glowbarForLid(true);
-            System.out.println("after 'lid closed': " + exec("settings", "get", "--user", user, "secure", GLOW_KEY).trim() + ", saved=" + readFile(GLOW_SAVED));
-            SystemClock.sleep(1500);
-            glowbarForLid(false);
-            System.out.println("after 'lid opened': " + exec("settings", "get", "--user", user, "secure", GLOW_KEY).trim() + ", saved=" + readFile(GLOW_SAVED));
             return;
         }
         if (args.length > 0 && args[0].equals("waketest")) {

@@ -162,9 +162,8 @@ helper is now built so that it can never block a system service:
   held (time in deep sleep does not count), and the exit is forced within 3 seconds even if a call hangs. A startup
   that does not finish within 3 minutes gives up in the same way, and the supervisor tries again later.
 - Only one helper can run at a time (a lock file), and the supervisor runs only one start or stop at a time (`flock`).
-- The locks belong to the helper's process, so GooglebookOS drops them if the helper dies. The one thing it changes
-  outside its own folder is the "Show Glowbar" switch during lid-closed sleep, and it keeps the value it replaced in
-  a file so the next helper can put it back if this one dies with the lid closed.
+- The locks belong to the helper's process, so GooglebookOS drops them if the helper dies. There is nothing else to
+  undo, because the helper never changes the lid state or any setting.
 - The helper must never stop you from waking the laptop. The sleep lock, which makes the power manager refuse wake
   requests, is held only with the lid closed; a lid opening releases it at once and the helper wakes the laptop if
   GooglebookOS's own wake was refused, and when docked any key, button or mouse event does the same. With the lid
@@ -361,8 +360,6 @@ Some typical lines:
 | `settle done, wakelock released` | The 20-second settle ended. |
 | `live check OK: lid closed, GooglebookOS keeps the laptop awake for Sleep Guard's lock` | The live check passed. |
 | `lid opened (4 wake holds while it was closed)` | The lid was opened; the count shows how often the laptop woke while it was closed. |
-| `lid closed: Glowbar kept dark for the sleep (your setting was 1, put back when the lid opens)` | The "Show Glowbar" switch was turned off for the sleep. |
-| `lid opened: Glowbar back on (your setting 1)` | Your Glowbar value was put back. |
 | `the lid opened while Sleep Guard held its lock: the laptop woke by itself` | The lid opened during a hold or a settle; the sleep lock was released at once and GooglebookOS's own wake went through. |
 | `woke the laptop after the lid opened (GooglebookOS's own wake-up had been refused while Sleep Guard held its sleep lock)` | The safety net had to wake the laptop itself after a lid opening. |
 | `power button press seen on cros_ec_buttons (lid closed)` | A power button event was read; with the lid closed and no dock it changes nothing. |
@@ -390,7 +387,6 @@ adb shell 'CLASSPATH=$(pm path --user current local.sleepguard | head -1 | cut -
 | `dumptest` | Reads the power service's report 20 times, then stops reading early on purpose (after 1 KB and after 1 millisecond) and confirms that the power service still answers normally. |
 | `locktest` | Takes the ordinary wakelock and then the sleep lock, confirms that the power service lists each as active and holds its kernel suspend blocker for the sleep lock, releases them and confirms that they are gone. |
 | `waketest` | Makes the wake-up call the safety net relies on (a no-op while the screen is on) and reports whether GooglebookOS accepted it. |
-| `glowtest` | Turns the "Show Glowbar" switch off and back on as at a lid close and a lid open, and prints the values; the system log shows the two signals to the EC. |
 | `repair` | Does nothing in this version and says so. Earlier versions changed the lid state and had to undo it after every helper exit; the current supervisor no longer runs it. |
 
 ## Updating, and what happens after app or GooglebookOS updates
@@ -508,31 +504,19 @@ opening the lid before unplugging the charger avoids the problem.
 **"another start/stop is still in progress".**
 Two start or stop requests overlapped. Wait half a minute and try again.
 
-**The glow bar on the lid lights up for long stretches or flashes while the laptop sleeps.**
-GooglebookOS's "Glowbar" (Settings, "Show Glowbar": "On your device lid, always on, and changes color when using
-Gemini") lights the bar whenever the laptop is awake, and the EC keeps it lit on its own during lid-closed sleep,
-where GooglebookOS wakes the laptop regularly anyway. Since October 26, 2026 Sleep Guard keeps the lid dark during
-sleep without taking the Glowbar away from you: when the lid closes it turns the "Show Glowbar" switch off (the log
-says "lid closed: Glowbar kept dark for the sleep"), and when the lid opens it puts your value back ("lid opened:
-Glowbar back on"). A Glowbar you keep off yourself is never touched. If the helper is stopped or restarted with the
-lid open, your value is put back at once; with the lid closed, the next helper puts it back when the lid opens. I
-noticed the behaviour after the GooglebookOS build of October 2026; I have not checked whether earlier builds lit
-the bar during sleep the same way.
-
 ## Safety and privacy notes
 
 - **No root and no system changes.** The helper runs as the adb shell user. It uses the power manager interface
   that the shell user is allowed to call (one keep-awake lock), it only reads the battery, device state and adb
-  reports, and it never modifies GooglebookOS itself. The one setting it writes is the "Show Glowbar" switch, off
-  while the lid is closed and back to your value when it opens.
+  reports, and it never modifies GooglebookOS itself.
 - **It never blocks a system service.** See [Safety and self-checks](#safety-and-self-checks): one-way report
   requests with a deadline, a size cap and a closed pipe on timeout, time limits on every command, and a watchdog.
 - **It never deletes files.** The supervisor and the helper keep their state by overwriting small files in
   `/data/local/tmp/sleepguard`. The logs are kept small by renaming a log over 2 MB to a `.1` file, which replaces
   the previous `.1` file.
 - **It never injects input, and it never changes the lid state.** Both locks keep the processor awake and nothing
-  else. The one thing it ever asks of the screen is a wake-up, and only right after you opened the lid while the
-  sleep lock was held and GooglebookOS's own wake had been refused.
+  else. The one thing it ever asks of the screen is a wake-up, and only right after you opened the lid or pressed the
+  power button while the sleep lock was held and GooglebookOS's own wake had been refused.
 - **Its own key and its own adb server.** Sleep Guard uses its own paired adb key and its own adb server port (5039),
   separate from your normal adb connection and from every other project. The keys stay in `~/.config/sleep-guard`
   and in the app's private storage, and they are never part of this repository.

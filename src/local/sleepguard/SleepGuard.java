@@ -101,10 +101,7 @@ public final class SleepGuard {
     static final String LOG = DIR + "/sleepguard.log";
     static final String STANDDOWN = DIR + "/standdown"; // "none" or "STANDING DOWN: <reason> | build=<fp>"
     static final String VERIFIED = DIR + "/verified";   // last build fingerprint verified live
-    static final String QUIET = DIR + "/quiet";         // "forced" while Sleep Guard has GooglebookOS's idle mode forced on (see quietSleep)
     static final int EXIT_WATCHDOG = 4, EXIT_STANDDOWN = 5, EXIT_RETRY = 6, EXIT_OTHER_RUNNING = 7;
-    /** Quiet sleep starts this long after the lid closes (GooglebookOS's own lid-close work comes first). */
-    static final long QUIET_AFTER_MS = 3000, QUIET_DEADLINE_MS = 1500;
 
     /** Something is only temporarily unavailable: the supervisor starts the helper again later. */
     static final class Retry extends Exception {
@@ -275,12 +272,6 @@ public final class SleepGuard {
     volatile boolean screenOnShared;     // the main loop's latest screen reading (for the wake detector)
     int lockFailures;                    // consecutive refused wake-hold locks, under grabLock
     volatile String lockFailure;         // handled by the main loop: stand down
-    // Quiet sleep (GooglebookOS's idle mode forced on while the lid is closed), see quietSleep.
-    volatile boolean quiet;              // idle mode is forced on by this helper right now
-    volatile long quietAt;               // uptime at which to start quiet sleep (0 = nothing pending)
-    volatile boolean quietRefused;       // GooglebookOS refused idle mode for this lid close: not asked again until the next
-    final Object quietLock = new Object();
-    final java.util.concurrent.atomic.AtomicBoolean quietWork = new java.util.concurrent.atomic.AtomicBoolean(); // one quiet-sleep thread at a time
 
     /** ReflectiveOperationException etc. = an interface changed (stand down); Retry = not available yet. */
     SleepGuard() throws Exception {
@@ -322,18 +313,13 @@ public final class SleepGuard {
     }
 
     String dump(String service, long deadlineMs, int maxBytes) {
-        return dump(service, new String[0], deadlineMs, maxBytes);
-    }
-
-    /** With arguments: a service's dump handler runs them as its shell command (e.g. "dumpsys deviceidle unforce"). */
-    String dump(String service, String[] args, long deadlineMs, int maxBytes) {
         FileDescriptor[] p = null;
         try {
             IBinder b = (IBinder) getService.invoke(null, service);
             if (b == null) return "";
             p = Os.pipe();
             try {
-                b.dumpAsync(p[1], args);
+                b.dumpAsync(p[1], new String[0]);
             } finally {
                 Os.close(p[1]); // the service has its own copy; EOF arrives when it finishes
             }
@@ -757,8 +743,6 @@ public final class SleepGuard {
         protectUntil = 0;
         releaseWake(why, false);
         releaseSettle(null);
-        quietAt = 0;
-        if (quiet) quietSleep(false, why); // idle mode is never left forced behind
     }
 
     boolean interactive() {
@@ -772,78 +756,6 @@ public final class SleepGuard {
 
     static long sleepOffset() {
         return SystemClock.elapsedRealtime() - SystemClock.uptimeMillis(); // grows by the time spent in deep sleep
-    }
-
-    // ---------------------------------------------------------------- quiet sleep
-    /** The value of "name=value" in a service report, "" if the report doesn't have it. */
-    static String field(String report, String name) {
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\b" + name + "=(\\S+)").matcher(report);
-        return m.find() ? m.group(1) : "";
-    }
-
-    /** GooglebookOS's idle mode report: "true" or "false" for mForceIdle, "" if unavailable. */
-    String idleForced() {
-        return field(dump("deviceidle"), "mForceIdle");
-    }
-
-    /**
-     * Quiet sleep. Found 2026-10-27 in the EC's own log: with the lid closed on the charger, apps' alarms
-     * (a weather widget, messengers, Play services) woke the sleeping laptop every four to five minutes
-     * all night, and at every wake the EC switches the lid light bar from its sleep pattern to its awake
-     * pattern for about two thirds of a second, so the light bar flashed all night. GooglebookOS does not
-     * enter its idle mode (Doze) by itself while the charger is connected, so those alarms all fire.
-     *
-     * While the lid is closed and the laptop sleeps, this helper forces idle mode on, with the same command
-     * developers use ("dumpsys deviceidle force-idle deep", sent as the service's dump arguments). In idle
-     * mode GooglebookOS lets apps' alarms wait (it sets their idle quota to zero) until the lid opens or its
-     * own maintenance window, exactly as it does by itself when the laptop sleeps on battery. Idle mode is
-     * ended the moment the lid opens, when the laptop turns out to be in use (screen on, docked), when the
-     * helper exits, and by the supervisor after any helper exit (the marker file QUIET tells it). It never
-     * blocks a wake-up: waking the laptop is the power service's job and idle mode does not touch it
-     * (tested 2026-10-27: forced on in 42 ms while charging with the screen on, ended in 56 ms).
-     * Never under grabLock (service calls with deadlines); from a background thread or the main loop.
-     */
-    void quietSleep(boolean on, String why) {
-        boolean failedToEnd = false;
-        synchronized (quietLock) {
-            if (on) {
-                if (quiet || exiting || quietRefused || !lidClosed || docked || interactive()) return;
-                String out = dump("deviceidle", new String[]{"force-idle", "deep"}, QUIET_DEADLINE_MS, 65536);
-                boolean forced = out.contains("forced in to deep idle mode") || "true".equals(idleForced());
-                if (!forced) {
-                    quietRefused = true; // not asked again before the next lid close
-                    log("quiet sleep not available: GooglebookOS did not switch to idle mode ("
-                            + (out.trim().isEmpty() ? "no answer" : out.trim().replace('\n', ' ')) + ")", true);
-                    return;
-                }
-                quiet = true;
-                writeFile(QUIET, "forced\n");
-                if (lidClosed && !interactive()) {
-                    log("quiet sleep: GooglebookOS's idle mode is on while the lid is closed (" + why
-                            + "): apps' alarms wait, the laptop and its light bar stay asleep", true);
-                    return;
-                }
-                why = "the lid opened as quiet sleep began"; // undo at once, below
-            }
-            if (!quiet && !"forced".equals(readFile(QUIET))) return;
-            String state = "";
-            boolean ended = false;
-            for (int i = 0; i < (exiting ? 1 : 3) && !ended; i++) {
-                if (i > 0) SystemClock.sleep(300);
-                dump("deviceidle", new String[]{"unforce"}, QUIET_DEADLINE_MS, 65536);
-                state = idleForced();
-                ended = "false".equals(state);
-            }
-            quiet = false;
-            writeFile(QUIET, ended ? "none\n" : "forced\n");
-            if (ended) log("quiet sleep ended: " + why, true);
-            else {
-                log("QUIET SLEEP COULD NOT BE ENDED (" + why + "): GooglebookOS reports mForceIdle="
-                        + (state.isEmpty() ? "unknown" : state) + "; a fresh helper and the supervisor try again", true);
-                failedToEnd = true;
-            }
-        }
-        if (failedToEnd && !exiting) retryLater("GooglebookOS's idle mode could not be ended"); // the supervisor runs unforce after every exit
     }
 
     // ---------------------------------------------------------------- lid
@@ -1001,8 +913,6 @@ public final class SleepGuard {
                             log("lid closed", true);
                         } else {
                             userWoke("the lid opened", WAKE_REASON_LID, false); // before the log and its disk sync
-                            quietAt = 0;
-                            if (quiet) background("quiet-off", () -> quietSleep(false, "the lid opened"));
                             log("lid opened (" + holdsThisClose.get() + " wake holds while it was closed)", true);
                         }
                         synchronized (wake) { wake.notifyAll(); }
@@ -1126,10 +1036,6 @@ public final class SleepGuard {
         Thread det = new Thread(this::wakeDetector, "wake-detector");
         det.setDaemon(true);
         det.start();
-        // Quiet sleep: whatever an earlier helper left is ended first (a crash could have left idle mode
-        // forced); with the lid already closed it starts again a few seconds from now.
-        if ("forced".equals(readFile(QUIET))) quietSleep(false, "an earlier helper had left it on");
-        if (lidClosed) quietAt = SystemClock.uptimeMillis() + QUIET_AFTER_MS;
 
         boolean prevCharger = charger;
         boolean prevLid = lidClosed;
@@ -1175,20 +1081,6 @@ public final class SleepGuard {
             final boolean lidEvent = lid != prevLid;
             if (lidEvent) fastUntil = Math.max(fastUntil, now + FAST_MS);
             if (lidEvent && lid) background("input-scan", () -> watchKeyDevices(false)); // a docked keyboard or mouse plugged in since
-            // Quiet sleep (see quietSleep): starts a few seconds after the lid closes, once the screen is off and
-            // the laptop is not docked; if the laptop is already asleep by then, at its next wake, which is
-            // exactly when it matters. Ended as soon as the lid is open, the screen is on or the laptop is docked.
-            if (lidEvent && lid) { quietRefused = false; quietAt = now + QUIET_AFTER_MS; }
-            if (lidEvent && !lid) quietAt = 0;
-            if (quietAt != 0 && now >= quietAt) {
-                if (!lid || docked) quietAt = 0;
-                else if (screenOn || !quietWork.compareAndSet(false, true)) quietAt = now + QUIET_AFTER_MS; // still turning off, or busy: shortly again
-                else { quietAt = 0; background("quiet-on", () -> { try { quietSleep(true, "the lid is closed"); } finally { quietWork.set(false); } }); }
-            }
-            if (quiet && (!lid || docked || screenOn) && quietWork.compareAndSet(false, true)) {
-                final String reason = !lid ? "the lid is open" : docked ? "the laptop is docked" : "the screen is on";
-                background("quiet-off", () -> { try { quietSleep(false, reason); } finally { quietWork.set(false); } });
-            }
             final boolean fast = now < fastUntil;
             final boolean grabbing = now < protectUntil && settleLock == null && wakeLock != null;
             if (now - lastPollAt >= (grabbing ? POLL_GRAB_MS : fast ? POLL_FAST_MS : screenOn ? POLL_IN_USE_MS : POLL_MS)) {
@@ -1478,28 +1370,6 @@ public final class SleepGuard {
             }
             return;
         }
-        if (args.length > 0 && args[0].equals("quiettest")) {
-            // Quiet sleep's two commands, bounded (run under `timeout`): idle mode forced on, read back,
-            // ended, read back. Takes about a second; apps notice nothing but a one-second idle mode.
-            SleepGuard g = new SleepGuard();
-            String before = g.idleForced();
-            long t0 = SystemClock.uptimeMillis();
-            String out = g.dump("deviceidle", new String[]{"force-idle", "deep"}, QUIET_DEADLINE_MS, 65536).trim();
-            long t1 = SystemClock.uptimeMillis();
-            String during = g.idleForced();
-            String st = field(g.dump("deviceidle"), "mState");
-            SystemClock.sleep(500);
-            long t2 = SystemClock.uptimeMillis();
-            g.dump("deviceidle", new String[]{"unforce"}, QUIET_DEADLINE_MS, 65536);
-            long t3 = SystemClock.uptimeMillis();
-            String after = g.idleForced();
-            String st2 = field(g.dump("deviceidle"), "mState");
-            System.out.println("idle mode before: forced=" + before + "; force-idle deep said \"" + out.replace('\n', ' ') + "\" in " + (t1 - t0)
-                    + " ms: forced=" + during + " state=" + st + "; unforce took " + (t3 - t2) + " ms: forced=" + after + " state=" + st2
-                    + "; power service " + (g.dump("power").contains("Wake Locks:") ? "responds normally" : "NO RESPONSE")
-                    + "; result: " + ("true".equals(during) && "false".equals(after) ? "OK" : "FAIL"));
-            return;
-        }
         if (args.length > 0 && args[0].equals("check")) {
             SleepGuard g = new SleepGuard();
             String dev = findLidDevice();
@@ -1513,8 +1383,7 @@ public final class SleepGuard {
                     + " base state=" + g.baseState() + " charger=" + g.chargerConnected()
                     + " wireless debugging port=" + g.adbWifiPort()
                     + " screen=" + (g.interactive() ? "on" : "off") + " key devices=" + keyDevices()
-                    + " idle mode forced=" + g.idleForced() + " quiet-sleep marker=" + readFile(QUIET)
-                    + " keep-awake=sleep lock with the lid closed or the ordinary wakelock with the lid open, wake safety net, quiet sleep build=" + fingerprint()
+                    + " keep-awake=sleep lock with the lid closed or the ordinary wakelock with the lid open, wake safety net build=" + fingerprint()
                     + (fingerprint().equals(readFile(VERIFIED)) ? " (verified)" : " (not yet verified)"));
             return;
         }

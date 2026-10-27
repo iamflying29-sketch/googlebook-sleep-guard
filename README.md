@@ -18,9 +18,8 @@ It has three parts:
 
 - **The helper** (`local.sleepguard.SleepGuard`) runs on GooglebookOS as the adb shell user, started with
   `app_process` straight from the installed app. It watches the lid, the charger and every wake from deep sleep, and
-  it holds the laptop awake for a moment when that is needed. While the lid is closed it also keeps the laptop in
-  GooglebookOS's idle mode, so apps' alarms do not wake it every few minutes and make the lid light bar flash (see
-  Quiet sleep below). A small supervisor script (`device/start.sh`) keeps it running and restarts it if it exits.
+  it holds the laptop awake for a moment when that is needed. A small supervisor script (`device/start.sh`) keeps it
+  running and restarts it if it exits.
 - **The Sleep Guard app** starts the helper after every reboot, every app update and every Wi-Fi reconnect, checks it
   every 15 minutes, shows its status, and posts a notification when something needs attention. It reaches the
   helper's shell through Wireless debugging on the Googlebook itself, using Sleep Guard's own paired key.
@@ -148,35 +147,6 @@ being refused twice ("Preventing waking device, due to wakelocks: 0x201"), the h
 5 milliseconds of the lid switch, and the helper's own wake-up going through 25 milliseconds later
 ("Waking up from Asleep (uid=2000, reason=WAKE_REASON_LID, details=SleepGuard:the lid opened)"). The screen came on
 at once, and the rest of the settle ran with the ordinary wakelock.
-
-### Quiet sleep: why the lid light bar flashed at night, and what Sleep Guard does about it
-
-In late October 2026 the lid light bar (the "Glowbar") started lighting up and flashing while my Googlebook slept with
-the lid closed on the charger. I took a bug report and read the EC's own console log, which records every change of
-an LED pattern and every power state change. It showed this:
-
-- With the lid closed on the charger, the laptop woke from deep sleep every four to five minutes, all night. The
-  battery history names the wakers: apps' alarms (a weather widget, a messenger, Play services and the like). On
-  battery GooglebookOS puts the laptop into its idle mode (Doze) and makes those alarms wait, but it never enters idle
-  mode while the charger is connected, so on the charger every alarm woke the laptop.
-- Each of those wakes lasted about 0.6 to 0.7 seconds, and at every one of them the EC switched the light bar from its
-  sleep pattern to its awake pattern and back. That is the flashing.
-- The EC firmware and its light bar patterns were identical before and after the GooglebookOS update of October 23,
-  2026 (I compared the EC logs of both builds: the same firmware version and the same pattern changes at every wake),
-  so there was nothing in the EC itself to fix. What I could change was the number of wakes.
-
-Quiet sleep does that. Three seconds after the lid closes (or at the laptop's next wake, if it is already asleep by
-then), the helper forces GooglebookOS's idle mode on, with the same command developers use
-(`dumpsys deviceidle force-idle deep`, sent as the service's dump arguments with the same deadline and cap as every
-other service call). GooglebookOS then lets apps' alarms wait, exactly as it does by itself when the laptop sleeps on
-battery (on this laptop GooglebookOS sets the idle-mode alarm quota to zero). The helper ends idle mode the moment the
-lid opens, as soon as the screen is on or the laptop is docked, and when it exits, and the supervisor ends it after
-any helper exit (a marker file, `quiet`, tells it whether a helper left it on). Idle mode never blocks a wake-up:
-waking the laptop is the power service's job, and idle mode does not touch it. The bounded test (`sleep-guard
-quiettest`) showed idle mode forced on in 1 to 42 milliseconds while charging with the screen on, and ended again in
-3 to 56 milliseconds, with the power service answering normally afterwards. GooglebookOS's own idle maintenance
-windows and alarms that it treats as unrestricted can still wake the laptop, so I expect a few short wakes per night
-rather than none; I have not yet measured a full night with quiet sleep on.
 
 ### Safety and self-checks
 
@@ -355,8 +325,7 @@ Sleep Guard leaves Wireless debugging alone.
 | `sleep-guard install-app [--force]` | Builds, installs or updates the app, grants its permissions, gives it the key and restarts the helper. `--force` skips the check that the app on the device is the one holding your key. |
 | `sleep-guard status [N]` | Shows whether Sleep Guard is running ("waiting" means the supervisor is running and starts the helper shortly), any stand-down, the build and whether it is verified, and the last N log lines (12 by default). This is also what `sleep-guard` with no command does. |
 | `sleep-guard log [N]` | Shows the last N lines of the helper's log (60 by default). |
-| `sleep-guard check` | Runs the helper's self-test once and prints the lid device, the lid state GooglebookOS sees, the charger, the Wireless debugging port, the screen state, the key and button devices, whether idle mode is forced on and the build. |
-| `sleep-guard quiettest` | Runs quiet sleep's two commands once, bounded: idle mode is forced on, read back, ended and read back, all within about a second. |
+| `sleep-guard check` | Runs the helper's self-test once and prints the lid device, the lid state GooglebookOS sees, the charger, the Wireless debugging port, the screen state, the key and button devices and the build. |
 | `sleep-guard start` | Turns Sleep Guard on. It also retries right away after a stand-down. |
 | `sleep-guard stop` | Stops Sleep Guard until the next `start`, also across reboots. |
 | `sleep-guard usb-debugging on` or `off` | Allows the app to keep USB debugging switched on, which keeps the helper alive if Wireless debugging drops. It is off by default. |
@@ -397,10 +366,6 @@ Some typical lines:
 | `watching for key presses on: [Power Button, cros_ec_buttons, ...]` | The key and button devices the helper watches for the safety net. |
 | `the settle goes on with an ordinary wakelock for 12 s` | The lid opened during a lid-closed settle; the rest of it runs with the ordinary wakelock. |
 | `asked the Sleep Guard app to publish the new address (...)` | Wireless debugging moved to a new port. |
-| `quiet sleep: GooglebookOS's idle mode is on while the lid is closed (the lid is closed): apps' alarms wait, the laptop and its light bar stay asleep` | Quiet sleep started. |
-| `quiet sleep ended: the lid opened` | Quiet sleep ended; the reason follows the colon (the lid opened, the screen is on, the laptop is docked, or the helper exits). |
-| `quiet sleep not available: GooglebookOS did not switch to idle mode (...)` | GooglebookOS refused idle mode; the helper asks again at the next lid close. Everything else works as before. |
-| `supervisor: ended quiet sleep left behind by a helper that is no longer running` | A helper had died with idle mode forced on; the supervisor ended it. |
 | `STANDING DOWN: ...` | Sleep Guard switched itself off safely, with the reason. |
 | `supervisor: helper exited (N)` | The helper exited with code N and the supervisor restarts it. |
 
@@ -422,7 +387,6 @@ adb shell 'CLASSPATH=$(pm path --user current local.sleepguard | head -1 | cut -
 | `dumptest` | Reads the power service's report 20 times, then stops reading early on purpose (after 1 KB and after 1 millisecond) and confirms that the power service still answers normally. |
 | `locktest` | Takes the ordinary wakelock and then the sleep lock, confirms that the power service lists each as active and holds its kernel suspend blocker for the sleep lock, releases them and confirms that they are gone. |
 | `waketest` | Makes the wake-up call the safety net relies on (a no-op while the screen is on) and reports whether GooglebookOS accepted it. |
-| `quiettest` | Forces GooglebookOS's idle mode on, reads it back, ends it after half a second and reads it back again, and reports the timings and whether the power service still answers (the same as `sleep-guard quiettest`). |
 | `repair` | Does nothing in this version and says so. Earlier versions changed the lid state and had to undo it after every helper exit; the current supervisor no longer runs it. |
 
 ## Updating, and what happens after app or GooglebookOS updates
@@ -589,17 +553,6 @@ Two start or stop requests overlapped. Wait half a minute and try again.
   small but not zero.
 - **During a lid-closed settle the laptop is awake for 20 seconds.** The screen stays off and nothing else changes,
   but the glow bar may light up during those seconds, because the EC lights it while the laptop is awake.
-- **Quiet sleep changes what apps do while the lid is closed.** With idle mode forced on, apps' alarms, jobs and
-  background network use wait until the lid opens, exactly as they do when the laptop sleeps on battery. Alarms that
-  GooglebookOS treats as unrestricted and its own idle maintenance windows still run, so a few short wakes per night
-  can remain, and the light bar still shows its awake pattern for well under a second at each of them. Quiet sleep is
-  new (October 27, 2026) and I have not yet measured a whole night with it.
-- **If the helper dies with idle mode forced on,** the supervisor ends idle mode right after the exit, a fresh helper
-  ends it at its start, and `start.sh` ends it whenever it runs with no helper alive (`status`, `start`, `ensure` and
-  `restart`). Only a helper and a supervisor killed at the same moment leave idle mode on. The app's next check ends it
-  then, which can take up to about an hour, because idle mode also delays the app's own scheduled checks. While that
-  lasts the laptop works normally, but background apps are restricted as they are on battery. I have not seen this
-  case happen.
 - **Waking during a lid-closed settle.** With the lid closed, the sleep lock is the only lock GooglebookOS honours,
   and while it is held the power manager refuses wake requests. Opening the lid always wakes the laptop at once.
   When docked, the helper watches every key and button device it can find (keys, buttons and mouse motion) and
@@ -616,8 +569,8 @@ Two start or stop requests overlapped. Wait half a minute and try again.
 
 | Path | What it is |
 | --- | --- |
-| `src/local/sleepguard/SleepGuard.java` | The helper: wake detection, wake holds and settles with the sleep lock, quiet sleep, lid reader, Wireless debugging port watch, self-test, live checks, watchdog and test modes |
-| `device/start.sh` | The on-device supervisor: start, stop, ensure, restart, status, retries and stand-downs; it also ends a quiet sleep that a dead helper left behind |
+| `src/local/sleepguard/SleepGuard.java` | The helper: wake detection, wake holds and settles with the sleep lock, lid reader, Wireless debugging port watch, self-test, live checks, watchdog and test modes |
+| `device/start.sh` | The on-device supervisor: start, stop, ensure, restart, status, retries and stand-downs |
 | `build.sh` | Builds `sleepguard.dex`, the helper on its own, for the bounded test modes. The supervisor always runs the helper from the installed app |
 | `app/AndroidManifest.xml` | The app's manifest and permissions |
 | `app/src/local/sleepguard/Starter.java` | Connects to Wireless debugging with Sleep Guard's key, runs the supervisor, publishes the address, posts notifications |

@@ -504,6 +504,16 @@ opening the lid before unplugging the charger avoids the problem.
 **"another start/stop is still in progress".**
 Two start or stop requests overlapped. Wait half a minute and try again.
 
+**The glow bar on the lid lights up for long stretches or flashes during sleep, since a GooglebookOS update.**
+This is GooglebookOS's own "Glowbar" feature, not Sleep Guard. The build from October 2026
+(`CL3B.260622.276.R4`) added a Glowbar page to Settings ("On your device lid, always on, and changes color when
+using Gemini") whose main switch, "Show Glowbar", is on by default; the light bar service then tells the EC that the
+idle light is allowed, and the EC lights the bar whenever the laptop is awake with the lid closed, including the
+regular wakes GooglebookOS itself performs during sleep. Switch it off in Settings (search for "Glowbar") or from a
+shell with `settings put --user 10 secure light_animation_idle_light_enabled 0` (your user id may differ); the
+system log then shows "Signaled Idle Light DISABLED (Suppressed) to EC". Sleep Guard's log for the same period
+shows nothing unusual, which is how I ruled it out on my laptop: its holds and settles were exactly as before.
+
 ## Safety and privacy notes
 
 - **No root and no system changes.** The helper runs as the adb shell user. It uses the power manager interface

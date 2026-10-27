@@ -39,6 +39,18 @@ SUP="sh $D/start.sh supervise"
 HLP="app_process / local.sleepguard.SleepGuard"
 # Our processes, found by their exact command line (pid files can be stale after a race).
 pids_of() { ps -A -o PID,ARGS 2>/dev/null | sed 1d | while read -r p a; do [ "$a" = "$1" ] && echo "$p"; done; }
+# Quiet sleep: the helper forces GooglebookOS's idle mode on while the lid is closed (marker file
+# $D/quiet says "forced") and ends it itself. Should a helper die with it still on, nobody must be left
+# in idle mode with the lid open: whenever no helper runs, idle mode is ended here (the same command the
+# helper uses; it does nothing when idle mode was not forced). Never while a helper is alive: the running
+# helper owns the state.
+end_quiet() {
+    [ "$(cat $D/quiet 2>/dev/null)" = forced ] || return 0
+    [ -n "$(pids_of "$HLP")" ] && return 0
+    timeout 10 dumpsys deviceidle unforce > /dev/null 2>&1
+    echo none > $D/quiet
+    slog "ended quiet sleep left behind by a helper that is no longer running"
+}
 
 stop_all() {
     [ -n "$(pids_of "$SUP")$(pids_of "$HLP")" ] && slog "stopping (sh start.sh $1)"
@@ -49,6 +61,7 @@ stop_all() {
     while [ -n "$(pids_of "$HLP")$(pids_of "$SUP")" ] && [ $n -lt 10 ]; do sleep 1; n=$((n + 1)); done
     for p in $(pids_of "$HLP") $(pids_of "$SUP"); do kill -9 $p 2>/dev/null; done
     echo "" > $D/helper.pid
+    end_quiet
 }
 
 # One control action (start/ensure/restart/stop) at a time, from any caller (app, boot, terminal).
@@ -67,6 +80,7 @@ locked() {
 }
 
 do_start() {   # $1 = start (the user's) | ensure (automatic)
+    end_quiet   # a stale quiet sleep (no helper alive) is ended whatever happens next
     [ "$1" = ensure ] && [ "$(control)" = stop ] && { echo "stopped by user"; return; }
     if [ "$1" = start ]; then
         was_down=0; standing_down && was_down=1
@@ -97,6 +111,7 @@ case "$1" in
     restart)      locked do_restart ;;
     stop)         locked do_stop ;;
     status)
+        end_quiet
         if supervisor_alive && helper_alive; then echo "running"
         elif supervisor_alive && standing_down; then echo "running (supervisor only)"
         elif supervisor_alive; then echo "waiting (the supervisor is running and starts the helper shortly)"
@@ -109,6 +124,7 @@ case "$1" in
         ;;
     supervise)
         echo $$ > $D/supervisor.pid
+        end_quiet
         fails=0; retries=0
         while [ "$(control)" != stop ]; do
             [ "$(cat $D/supervisor.pid 2>/dev/null)" = "$$" ] || exit 0   # another supervisor took over
@@ -124,6 +140,7 @@ case "$1" in
                 if [ ! -d /proc/$orphan ]; then
                     slog "the watched helper (pid $orphan) exited"
                     echo "" > $D/helper.pid
+                    end_quiet
                 fi
                 continue
             fi
@@ -145,6 +162,7 @@ case "$1" in
             wait $!
             code=$?
             echo "" > $D/helper.pid
+            end_quiet            # whatever the exit, idle mode is never left forced behind
             [ "$(control)" = stop ] && break
             slog "helper exited ($code)"
             ran=$(( $(date +%s) - t0 ))

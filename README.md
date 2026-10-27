@@ -507,12 +507,14 @@ Two start or stop requests overlapped. Wait half a minute and try again.
 **The glow bar on the lid lights up for long stretches or flashes during sleep, since a GooglebookOS update.**
 This is GooglebookOS's own "Glowbar" feature, not Sleep Guard. The build from October 2026
 (`CL3B.260622.276.R4`) added a Glowbar page to Settings ("On your device lid, always on, and changes color when
-using Gemini") whose main switch, "Show Glowbar", is on by default; the light bar service then tells the EC that the
-idle light is allowed, and the EC lights the bar whenever the laptop is awake with the lid closed, including the
-regular wakes GooglebookOS itself performs during sleep. Switch it off in Settings (search for "Glowbar") or from a
-shell with `settings put --user 10 secure light_animation_idle_light_enabled 0` (your user id may differ); the
-system log then shows "Signaled Idle Light DISABLED (Suppressed) to EC". Sleep Guard's log for the same period
-shows nothing unusual, which is how I ruled it out on my laptop: its holds and settles were exactly as before.
+using Gemini") whose main switch, "Show Glowbar", is on by default (`DEFAULT_IDLE_LIGHT_ENABLED = 1` in the light
+bar service, which I read in the build's code). With it on, the light bar service tells the EC that the idle light
+is allowed, and the EC runs the bar on its own while the laptop sleeps with the lid closed; GooglebookOS logs
+nothing about the bar during sleep, so the pattern you see is the EC's. Switch it off in Settings (search for
+"Glowbar") or from a shell with `settings put --user 10 secure light_animation_idle_light_enabled 0` (your user id
+may differ); the system log then shows "Signaled Idle Light DISABLED (Suppressed) to EC". Sleep Guard's log for the
+same period showed nothing unusual on my laptop, which is how I ruled it out: its holds and settles were exactly as
+before the update.
 
 ## Safety and privacy notes
 
